@@ -13,7 +13,7 @@ function App() {
     setIsRanking(true);
     try {
       // 呼叫你的 FastAPI 後端實體數據
-      const response = await fetch(`${API_BASE_URL}/analyze`, {
+      const response = await fetch(`${API_BASE_URL}//api/buffett-analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbols: ['AAPL', 'TSLA', 'NVDA', 'BRK-B', 'MSFT', 'GOOGL', 'AMZN'] })
