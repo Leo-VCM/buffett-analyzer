@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { TrendingUp, Activity, Shield, Calendar, RefreshCw, DollarSign } from 'lucide-react';
 
 // 注意：部署到 Render 後，記得在 Render 的 Environment Variables 設定 REACT_APP_API_URL
-const API_BASE_URL = process.env.REACT_APP_API_URL || "http://localhost:10000";
+const API_BASE_URL = "https://buffett-analyzer.onrender.com";
 
 function App() {
   const [rankings, setRankings] = useState([]);
