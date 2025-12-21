@@ -24,6 +24,12 @@ app.add_middleware(
 class StockRequest(BaseModel):
     symbols: List[str]
 
+# 把這段加在 main.py 裡面
+@app.get("/test-analyze")
+async def test_analyze():
+    analyzer = BuffettStyleAnalyzer("AAPL")
+    return analyzer.analyze()
+
 @app.get("/")
 async def root():
     return {"message": "巴菲特風格分析 API 已啟動"}
