@@ -4,3 +4,4 @@ yfinance
 pandas
 pydantic
 lxml
+requests
