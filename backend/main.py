@@ -32,38 +32,40 @@ async def root():
 
 @app.get("/api/sp500-analysis")
 async def analyze_sp500_top():
-    """
-    自動抓取 S&P 500 前 50 支股票並進行排名
-    注意：Render 免費版抓取 50 支約需 45-60 秒
-    """
     try:
-        print(">>> 正在從維基百科獲取 S&P 500 最新清單...")
-        # 抓取維基百科表格
-        tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+        print(">>> 正在獲取 S&P 500 清單 (加上 User-Agent)...")
+        
+        # 解決 403 Forbidden 的關鍵：偽裝成一般瀏覽器
+        import requests
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        response = requests.get(url, headers=headers)
+        tables = pd.read_html(response.text)
         df = tables[0]
         
-        # 取得前 50 支代碼 (通常按市值權重排序)
-        # 如果 Render 經常超時，可以把 50 改成 30
-        top_50_symbols = df['Symbol'].tolist()[:50]
+        # 取得前 30 支（先改為 30 支確保穩定性，成功後再改回 50）
+        top_symbols = df['Symbol'].tolist()[:30]
         
         results = []
-        print(f">>> 開始逐一分析這 {len(top_50_symbols)} 支股票...")
-        
-        for index, symbol in enumerate(top_50_symbols):
+        for index, symbol in enumerate(top_symbols):
             try:
-                # 處理美股代碼特殊符號 (如 BRK.B 轉為 BRK-B)
                 clean_symbol = symbol.replace('.', '-')
                 analyzer = BuffettStyleAnalyzer(clean_symbol)
-                data = analyzer.analyze()
-                results.append(data)
-                
-                # 每 5 支在 Log 印一次進度
+                results.append(analyzer.analyze())
                 if (index + 1) % 5 == 0:
-                    print(f"進度: {index + 1}/{len(top_50_symbols)} 完成")
-                    
-            except Exception as e:
-                print(f"⚠️ 跳過 {symbol}: {str(e)}")
+                    print(f"進度: {index + 1}/{len(top_symbols)}")
+            except:
                 continue
+        
+        results.sort(key=lambda x: x['buffettScore'], reverse=True)
+        return {"status": "success", "count": len(results), "rankings": results}
+        
+    except Exception as e:
+        print(f"❌ 錯誤原因: {e}")
+        return {"status": "error", "message": f"數據獲取失敗: {str(e)}"}
         
         # 依照巴菲特評分 (buffettScore) 由高到低排序
         results.sort(key=lambda x: x['buffettScore'], reverse=True)
