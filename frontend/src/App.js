@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { TrendingUp, ShieldCheck, Activity, AlertCircle, Clock } from 'lucide-react';
+import React, { useState } from 'react';
+import { TrendingUp, Activity, Clock } from 'lucide-react';
 
 // 記得將此網址替換為你真實的 Render 後端網址
 const API_BASE_URL = "https://buffett-analyzer.onrender.com";
@@ -11,12 +11,11 @@ const App = () => {
 
   const startAnalysis = async () => {
     setIsRanking(true);
-    setRankings([]); // 按下時先清空舊卡片
+    // 按下時不一定要清空舊卡片，可以保留讓用戶看，數據回來再更新
     
     try {
       console.log("開始發送 S&P 500 分析請求...");
       
-      // 使用 GET 請求呼叫我們新的 S&P 500 專用 API
       const response = await fetch(`${API_BASE_URL}/api/sp500-analysis`);
       
       if (!response.ok) {
@@ -25,15 +24,17 @@ const App = () => {
 
       const data = await response.json();
       
+      // 配合後端 P1 快取格式：數據在 data.rankings 中
       if (data.status === "success" && data.rankings) {
         setRankings(data.rankings);
-        setLastUpdateTime(new Date());
+        // 直接存儲後端傳來的時間字串
+        setLastUpdateTime(data.last_updated);
       } else {
         alert("數據獲取失敗: " + (data.message || "未知原因"));
       }
     } catch (error) {
       console.error("Analysis Error:", error);
-      alert("連線超時或失敗！\n\n原因：分析 50 支股票需要約 1 分鐘，Render 免費版有時會中斷連線。\n建議：稍等片刻再試一次，或在後端將數量改為 30 支。");
+      alert("連線超時或失敗！\n\n原因：分析 50 支股票需要較長時間。\n提示：若伺服器正在喚醒或更新快取，請稍等 1 分鐘後再試。");
     } finally {
       setIsRanking(false);
     }
@@ -48,7 +49,9 @@ const App = () => {
           巴菲特選股：S&P 500 即時排名
         </h1>
         <p className="text-slate-600 max-w-2xl mx-auto mb-8">
-          本系統自動抓取 S&P 500 權值股，基於巴菲特價值投資邏輯（ROE、PE、獲利穩定度）進行即時量化評分。
+          基於巴菲特價值投資邏輯（ROE、PE、獲利穩定度）進行量化評分。
+          <br />
+          <span className="text-sm font-medium text-blue-500">※ 每日自動更新快取，第二次查詢僅需 0.1 秒</span>
         </p>
         
         <div className="flex flex-col items-center gap-4">
@@ -64,7 +67,7 @@ const App = () => {
             {isRanking ? (
               <>
                 <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
-                大腦計算中 (預計需 45-60 秒)...
+                伺服器計算中 (首次約 45 秒)...
               </>
             ) : (
               '開始即時分析 S&P 500 前 50 強'
@@ -74,7 +77,7 @@ const App = () => {
           {lastUpdateTime && (
             <div className="flex items-center gap-2 text-sm text-slate-500">
               <Clock size={14} />
-              最後更新時間：{lastUpdateTime.toLocaleTimeString()}
+              最後更新時間：{lastUpdateTime} (24小時自動刷新)
             </div>
           )}
         </div>
@@ -120,7 +123,8 @@ const App = () => {
               <div className="grid grid-cols-2 gap-4 mt-6">
                 <div className="bg-slate-50 p-3 rounded-xl text-center">
                   <div className="text-slate-400 text-xs mb-1">ROE</div>
-                  <div className="font-bold text-slate-700">{(stock.fundamentals.roe * 100).toFixed(1)}%</div>
+                  {/* 修改點：直接顯示 ROE，不再乘 100 */}
+                  <div className="font-bold text-slate-700">{stock.fundamentals.roe?.toFixed(1)}%</div>
                 </div>
                 <div className="bg-slate-50 p-3 rounded-xl text-center">
                   <div className="text-slate-400 text-xs mb-1">預估 PE</div>
