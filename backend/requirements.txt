@@ -5,3 +5,4 @@ pandas
 pydantic
 lxml
 requests
+beautifulsoup4
