@@ -8,6 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from buffett_analyzer import BuffettStyleAnalyzer
 
 app = FastAPI()
+@app.get("/")
+def read_root():
+    return {
+        "status": "Online",
+        "project": "Buffett Style S&P 500 Analyzer",
+        "api_endpoint": "/api/sp500-analysis",
+        "message": "Welcome! Access the API endpoint to see the stock rankings."
+    }
 
 # 解決跨域問題
 app.add_middleware(
