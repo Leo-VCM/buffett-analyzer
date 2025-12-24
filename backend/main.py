@@ -3,59 +3,80 @@ import os
 import time
 import requests
 import pandas as pd
+from io import StringIO  # 1. 確保這行有加
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from buffett_analyzer import BuffettStyleAnalyzer
 
 app = FastAPI()
 
-# --- 步驟 1: 務必先設定 CORSMiddleware ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True, # 建議加上這行
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 步驟 2: 設定常數 ---
 CACHE_FILE = "sp500_cache.json"
 CACHE_EXPIRE_SECONDS = 86400
 
-# --- 步驟 3: 定義工具函數 ---
 def get_sp500_tickers():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
     res = requests.get(url, headers=headers)
-    df = pd.read_html(res.text)[0]
+    # 2. 修正核心：解決 Log 裡的 FutureWarning
+    df = pd.read_html(StringIO(res.text))[0] 
     return df['Symbol'].tolist()
 
-# --- 步驟 4: 定義所有路由 ---
 @app.get("/")
 def read_root():
-    return {
-        "status": "Online",
-        "project": "Buffett Style S&P 500 Analyzer",
-        "api_endpoint": "/api/sp500-analysis",
-        "message": "Welcome!"
-    }
+    return {"status": "Online", "message": "Welcome!"}
 
 @app.get("/api/sp500-analysis")
 def get_analysis():
-    # ... 你的分析邏輯 (保持不變) ...
+    # 檢查快取
     if os.path.exists(CACHE_FILE):
         file_time = os.path.getmtime(CACHE_FILE)
         if (time.time() - file_time) < CACHE_EXPIRE_SECONDS:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cache_data = json.load(f)
+                # 確保快取內有數據才回傳，避免傳回 null
+                if cache_data.get("rankings"):
+                    return cache_data
     
-    # (其餘邏輯...)
-    # 建議在 try block 加上更詳細的 print 方便看 Render 日誌
     try:
         all_tickers = get_sp500_tickers()
-        test_tickers = all_tickers[:50]
-        # ...
-        # (後面邏輯維持原樣)
+        # 3. 修正核心：先降到 50 支，避免 Render 記憶體爆掉導致 Shutting down
+        test_tickers = all_tickers[:50] 
+        
+        results = []
+        for symbol in test_tickers:
+            try:
+                print(f"正在分析: {symbol}") # 方便在 Render Log 追蹤進度
+                analyzer = BuffettStyleAnalyzer(symbol.replace('.', '-'))
+                data = analyzer.analyze()
+                if data:
+                    results.append(data)
+            except Exception as e:
+                print(f"{symbol} 失敗: {str(e)}")
+                continue
+        
+        if not results:
+            return {"status": "error", "message": "No data found"}
+
+        results.sort(key=lambda x: x['buffettScore'], reverse=True)
+
+        final_data = {
+            "status": "success",
+            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "rankings": results
+        }
+
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(final_data, f, ensure_ascii=False, indent=4)
+            
+        return final_data
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
