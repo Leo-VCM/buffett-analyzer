@@ -10,78 +10,59 @@ from buffett_analyzer import BuffettStyleAnalyzer
 
 app = FastAPI()
 
+# 跨域設定：對齊前端 URL
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # 部署建議改為 https://buffett-frontend.onrender.com
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 CACHE_FILE = "sp500_cache.json"
-CACHE_EXPIRE_SECONDS = 86400
+CACHE_EXPIRE = 86400
 
 def get_sp500_tickers():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get(url, headers=headers)
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
         df = pd.read_html(StringIO(res.text))[0]
         return df['Symbol'].tolist()
-    except Exception as e:
-        print(f"Fetch Error: {e}")
-        return []
-
-@app.get("/")
-def read_root():
-    return {"status": "Online", "message": "Buffett Multi-Factor API"}
+    except:
+        return ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "BRK-B", "TSLA"]
 
 @app.get("/api/sp500-analysis")
 def get_analysis():
-    # 1. 讀取快取
+    # 檢查快取
     if os.path.exists(CACHE_FILE):
-        file_time = os.path.getmtime(CACHE_FILE)
-        if (time.time() - file_time) < CACHE_EXPIRE_SECONDS:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("rankings"):
-                    return data
+        if (time.time() - os.path.getmtime(CACHE_FILE)) < CACHE_EXPIRE:
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+
+    # 執行分析
+    tickers = get_sp500_tickers()[:30] # 免費版 Render 建議先跑 30 支
+    rankings = []
     
-    # 2. 執行分析
-    try:
-        all_tickers = get_sp500_tickers()
-        # Render 免費版建議跑 30-50 支，避免超時與記憶體溢出
-        test_tickers = all_tickers[:40] 
-        
-        results = []
-        for symbol in test_tickers:
-            print(f"Analyzing: {symbol}")
-            # 處理 BRK.B 這種代號
-            analyzer = BuffettStyleAnalyzer(symbol.replace('.', '-'))
-            data = analyzer.analyze()
-            if data:
-                results.append(data)
-            time.sleep(0.2) # 禮貌性延遲
-        
-        if not results:
-            return {"status": "error", "message": "Analysis returned empty"}
+    for symbol in tickers:
+        analyzer = BuffettStyleAnalyzer(symbol.replace('.', '-'))
+        data = analyzer.analyze()
+        if data:
+            rankings.append(data)
+        time.sleep(0.1)
 
-        # 按分數排序
-        results.sort(key=lambda x: x['buffettScore'], reverse=True)
+    # 排序
+    rankings.sort(key=lambda x: x['buffettScore'], reverse=True)
 
-        final_data = {
-            "status": "success",
-            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "rankings": results
-        }
+    result = {
+        "status": "success",
+        "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "rankings": rankings
+    }
 
-        # 寫入快取
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(final_data, f, ensure_ascii=False, indent=4)
-            
-        return final_data
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    with open(CACHE_FILE, "w") as f:
+        json.dump(result, f)
+
+    return result
 
 if __name__ == "__main__":
     import uvicorn
