@@ -6,7 +6,7 @@ import pandas as pd
 from io import StringIO  # 1. 確保這行有加
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from buffett_analyzer import BuffettStyleAnalyzer
+from buffett_analyzer import PortfolioScreener
 
 app = FastAPI()
 
