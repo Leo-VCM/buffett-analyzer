@@ -1,3 +1,7 @@
+"""
+Buffett Analyzer API - 巴菲特量化分析系統後端
+適用於 Render 免費方案部署
+"""
 import os
 import logging
 import random
@@ -13,7 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # --- 初始化 ---
-app = FastAPI(title="Buffett Analyzer API", version="2.0")
+app = FastAPI(
+    title="Buffett Analyzer API", 
+    version="2.0",
+    description="巴菲特量化即時分析系統 API",
+    docs_url="/docs",  # Swagger UI
+    redoc_url="/redoc"  # ReDoc
+)
 
 # CORS 設定
 app.add_middleware(
