@@ -1,9 +1,19 @@
-fastapi
-uvicorn
-yfinance
-pandas
-numpy
-requests
-lxml
-html5lib
+# FastAPI 框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
 
+# 數據處理
+pandas==2.2.0
+numpy==1.26.3
+
+# 金融數據
+yfinance==0.2.36
+
+# HTTP 快取
+requests-cache==1.1.1
+
+# 數據驗證
+pydantic==2.5.0
+
+# 可選：如果需要更好的效能
+# gunicorn==21.2.0
