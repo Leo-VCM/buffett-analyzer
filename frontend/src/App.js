@@ -26,9 +26,9 @@ const App = () => {
     setError(null);
     
     try {
-      console.log('📡 獲取 TOP 25 股票池...');
+      console.log('📡 正在連接後端分析引擎...');
       
-      const response = await fetch(`${API_BASE_URL}/api/top-25`, {
+      const response = await fetch(`${API_BASE_URL}/sp500-analysis`, {
         method: 'GET',
         headers: { 'Accept': 'application/json' },
         signal: AbortSignal.timeout(180000) // 3分鐘超時
@@ -39,14 +39,30 @@ const App = () => {
       }
       
       const data = await response.json();
-      console.log('✅ TOP 25 數據:', data);
+      console.log('✅ 收到後端數據:', data);
       
-      setTop25Stocks(data.top_25_stocks || []);
-      setStatistics(data.statistics);
+      /* --- 關鍵的對接邏輯 --- */
+      // 1. 處理股票清單：如果是後端的 'rankings' 則抓取
+      const stocks = data.rankings || data.top_25_stocks || [];
+      setTop25Stocks(stocks);
+      
+      // 2. 處理統計數據：如果後端暫時沒給，我們前端手動計算一個簡單的版本，避免統計區塊空白
+      if (data.statistics) {
+        setStatistics(data.statistics);
+      } else if (stocks.length > 0) {
+        const avgScore = stocks.reduce((acc, curr) => acc + curr.buffettScore, 0) / stocks.length;
+        const avgRisk = stocks.reduce((acc, curr) => acc + curr.totalRisk, 0) / stocks.length;
+        setStatistics({
+          average_score: avgScore.toFixed(1),
+          average_risk: avgRisk.toFixed(1),
+          high_grade_stocks: stocks.filter(s => s.buffettScore > 60).length,
+          sector_distribution: {} // 暫時留空
+        });
+      }
       
     } catch (error) {
       console.error("❌ 獲取失敗:", error);
-      setError(error.message || "無法連接到伺服器");
+      setError("分析引擎啟動中或數據載入超時，請稍候再試 (約需 1 分鐘)");
     } finally {
       setIsLoading(false);
     }
