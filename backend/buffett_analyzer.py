@@ -148,6 +148,17 @@ background_task = None
 
 async def daily_update_task():
     """每日定時更新任務"""
+    # 首次檢查是否需要初始分析
+    if not cache_manager.is_cache_valid():
+        logger.info("🔄 執行初始分析...")
+        try:
+            result = await perform_full_analysis()
+            if result:
+                cache_manager.save_cache(result)
+                logger.info("✅ 初始分析完成")
+        except Exception as e:
+            logger.error(f"❌ 初始分析失敗: {e}")
+    
     while True:
         try:
             now = datetime.now()
@@ -193,15 +204,10 @@ async def lifespan(app: FastAPI):
     # 載入現有快取
     cache_manager.load_cache()
     
-    # 如果快取無效,立即執行一次分析
+    # 不在啟動時執行分析,避免 Render 健康檢查超時
+    # 初始分析將在背景任務中處理
     if not cache_manager.is_cache_valid():
-        logger.info("⚠️ 快取無效,執行初始分析...")
-        try:
-            result = await perform_full_analysis()
-            if result:
-                cache_manager.save_cache(result)
-        except Exception as e:
-            logger.error(f"❌ 初始分析失敗: {e}")
+        logger.warning("⚠️ 快取無效,將在背景執行初始分析...")
     
     # 啟動背景更新任務
     background_task = asyncio.create_task(daily_update_task())
