@@ -153,14 +153,42 @@ class SectorAnalysis(BaseModel):
 class BuffettStockPicker:
     """巴菲特選股引擎 - 基於價值投資原則"""
     
-    # 巴菲特的核心標準
+    # 巴菲特的核心標準定義
     BUFFETT_CRITERIA = {
-        "roe_threshold": 15,          # ROE > 15%
-        "pe_max": 25,                 # P/E < 25
-        "debt_to_equity_max": 100,    # 債務權益比 < 100%
-        "profit_margin_min": 10,      # 利潤率 > 10%
-        "consistent_earnings": True,   # 穩定盈利
-        "moat": True,                 # 護城河（品牌、專利等）
+        "roe": {
+            "threshold": 15, 
+            "label": "股東權益報酬率 (ROE)",
+            "unit": "%",
+            "operator": ">="
+        },
+        "pe": {
+            "threshold": 25, 
+            "label": "本益比 (P/E)",
+            "unit": "",
+            "operator": "<="
+        },
+        "debt_to_equity": {
+            "threshold": 1.0, # 財報通常用比率，100% = 1.0
+            "label": "債務權益比",
+            "unit": "",
+            "operator": "<="
+        },
+        "profit_margin": {
+            "threshold": 10, 
+            "label": "淨利率",
+            "unit": "%",
+            "operator": ">="
+        },
+        "consistent_earnings": {
+            "required": True,
+            "label": "獲利穩定度",
+            "description": "過去 3-5 年連續盈利"
+        },
+        "moat": {
+            "required": True,
+            "label": "經濟護城河",
+            "description": "品牌影響力或市場獨佔地位"
+        }
     }
     
     def __init__(self, symbol: str, sector: str):
@@ -185,16 +213,29 @@ class BuffettStockPicker:
             else:
                 logger.info(f"✅ {self.symbol} ({self.sector}) 使用快取")
 
-            # 獲取數據
+            # ==================== 優化後的獲取數據 ====================
             try:
+                # 1. 建議先檢查 ticker 是否有效
+                # info 獲取非常緩慢且容易失敗，可以考慮使用 fast_info 作為備選
                 info = self.stock.info
-                hist = self.stock.history(period="1y")
+                
+                # 2. 歷史數據抓取 
+                # 加入 auto_adjust=True 確保股價經過還原（考慮除權息）
+                hist = self.stock.history(period="1y", auto_adjust=True)
+                
             except Exception as e:
-                logger.error(f"❌ {self.symbol}: 數據獲取失敗 - {e}")
+                # 捕捉特定錯誤，避免因為某一隻股票崩潰導致整個併發任務失敗
+                logger.error(f"❌ {self.symbol}: 數據獲取發生異常 - {str(e)}")
                 return None
             
-            if not info or hist.empty or len(hist) < 50:
-                logger.warning(f"❌ {self.symbol}: 數據不足")
+            # 3. 數據完整性檢查
+            # 檢查 info 是否為空，或是否只是一個錯誤訊息字典
+            if not info or len(info) < 5: 
+                logger.warning(f"❌ {self.symbol}: 無法獲取公司基本面資料 (Info 為空)")
+                return None
+            
+            if hist.empty or len(hist) < 20: # 寬鬆一點，有時新上市股票天數較少
+                logger.warning(f"❌ {self.symbol}: 股價歷史數據不足")
                 return None
 
             # 基本資訊
@@ -208,115 +249,215 @@ class BuffettStockPicker:
             if not current_price or current_price <= 0:
                 return None
 
-            # 財務指標
-            roe = info.get('returnOnEquity', 0)
-            norm_roe = (roe * 100) if abs(roe) < 1 else roe
+            # ==================== 財務指標清洗與標準化 ====================
             
-            pe = info.get('forwardPE') or info.get('trailingPE') or 25
-            pe = min(pe, 200) if pe > 0 else 25
+            # 1. ROE 處理 (yfinance 通常給 0.15 代表 15%)
+            raw_roe = info.get('returnOnEquity')
+            if raw_roe is not None:
+                # 自動偵測：如果是 0.15 轉為 15；如果是 15 則維持 15
+                roe = raw_roe * 100 if abs(raw_roe) < 1 else raw_roe
+            else:
+                roe = 0  # 缺失值設為 0，評分時會反映出數據不足
+                
+            # 2. P/E 處理 (本益比)
+            # 優先順序：預估 P/E > 滾動 P/E
+            pe = info.get('forwardPE') or info.get('trailingPE')
+            if pe is None or pe <= 0:
+                pe = 999  # 使用極大值而非 25，因為 P/E 越小越好，999 代表「極不推薦」
+            else:
+                pe = min(pe, 500)  # 限制上限，避免極端數值破壞圖表
+                
+            # 3. 淨利率 (Profit Margin)
+            # yfinance 的 profitMargins 幾乎都是小數 (例如 0.2 = 20%)
+            margin = info.get('profitMargins')
+            profit_margin = (margin * 100) if margin is not None else 0
             
-            profit_margin = info.get('profitMargins', 0) * 100
-            debt_to_equity = info.get('debtToEquity', 0)
+            # 4. 債務權益比 (Debt to Equity)
+            # 注意：yfinance 有些回傳 100 代表 100%，有些回傳 1.0
+            raw_d_e = info.get('debtToEquity')
+            if raw_d_e is not None:
+                debt_to_equity = raw_d_e if raw_d_e < 5 else raw_d_e / 100
+            else:
+                debt_to_equity = 2.0  # 缺失值預設為較高風險 (200%)
             
-            # 市場分析
-            ma200 = hist['Close'].rolling(window=min(200, len(hist))).mean().iloc[-1]
-            market_phase = "牛市" if current_price > ma200 else "熊市"
+            # ==================== 市場分析與趨勢判斷 ====================
             
-            # 動能
-            one_year_ago = hist['Close'].iloc[0]
-            momentum_1y = ((current_price - one_year_ago) / one_year_ago) * 100
+            # 1. 計算 MA200 (長期趨勢線)
+            # 使用 min_periods=1 確保數據不足 200 天時也能計算出平均值，不至於報錯
+            ma200_series = hist['Close'].rolling(window=200, min_periods=1).mean()
+            ma200 = ma200_series.iloc[-1]
             
-            six_months_idx = min(126, len(hist) - 1)
-            six_months_ago = hist['Close'].iloc[-six_months_idx]
-            momentum_6m = ((current_price - six_months_ago) / six_months_ago) * 100
-            is_positive_momentum = momentum_6m > 0
+            # 2. 計算 MA50 (中期趨勢線，巴菲特也看重中期支撐)
+            ma50 = hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1]
+            
+            # 3. 更精準的市場階段判斷 (Market Phase)
+            # 對於單一股票，我們通常看它是處於「上升通道」還是「修正階段」
+            if current_price > ma200:
+                market_phase = "多頭排列" if current_price > ma50 else "高檔震盪"
+            else:
+                market_phase = "空頭趨勢" if current_price < ma50 else "低檔打底"
+            
+            # 4. 計算價格偏離度 (與 MA200 的距離)
+            # 這是風險評估的重要指標：如果股價高於 MA200 太多，可能代表過熱
+            price_deviation = ((current_price - ma200) / ma200) * 100
+            
+            # ==================== 動能與趨勢強度分析 ====================
+            
+            # 1. 一年動能 (Momentum 1Y)
+            # 使用 try-except 確保數據量極少時不會 index out of bounds
+            try:
+                one_year_ago = hist['Close'].iloc[0]
+                momentum_1y = ((current_price - one_year_ago) / one_year_ago) * 100
+                
+                # 2. 六個月動能 (Momentum 6M)
+                # 使用 len(hist)//2 或是精確找 126 個交易日
+                half_year_idx = len(hist) // 2
+                six_months_ago = hist['Close'].iloc[half_year_idx]
+                momentum_6m = ((current_price - six_months_ago) / six_months_ago) * 100
+                
+                # 3. 短期強勢 (1個月動能) - 巴菲特雖看長，但進場看短
+                one_month_idx = max(0, len(hist) - 21)
+                one_month_ago = hist['Close'].iloc[one_month_idx]
+                momentum_1m = ((current_price - one_month_ago) / one_month_ago) * 100
+                
+            except Exception as e:
+                logger.warning(f"⚠️ {self.symbol} 動能計算失敗: {e}")
+                momentum_1y, momentum_6m, momentum_1m = 0, 0, 0
 
-            # 巴菲特標準評估
+            # 4. 動能狀態判斷
+            # 好的價值股應該是：長期低估 + 中短期動能轉強
+            is_positive_momentum = momentum_6m > 0 and momentum_1m > -5
+
+            # ==================== 1. 巴菲特標準檢查 (布林值) ====================
             buffett_criteria = {
-                "high_roe": norm_roe >= self.BUFFETT_CRITERIA["roe_threshold"],
-                "reasonable_pe": 0 < pe <= self.BUFFETT_CRITERIA["pe_max"],
-                "low_debt": debt_to_equity <= self.BUFFETT_CRITERIA["debt_to_equity_max"],
-                "profitable": profit_margin >= self.BUFFETT_CRITERIA["profit_margin_min"],
+                "high_roe": roe >= self.BUFFETT_CRITERIA["roe"]["threshold"],
+                "reasonable_pe": 0 < pe <= self.BUFFETT_CRITERIA["pe"]["threshold"],
+                # 注意：debt_to_equity 在清洗時已標準化，此處判斷應與閾值一致
+                "low_debt": debt_to_equity <= (self.BUFFETT_CRITERIA["debt_to_equity"]["threshold"]),
+                "profitable": profit_margin >= self.BUFFETT_CRITERIA["profit_margin"]["threshold"],
                 "positive_momentum": is_positive_momentum
             }
             
-            criteria_passed = sum(buffett_criteria.values())
-            buffett_grade = "A+" if criteria_passed >= 5 else "A" if criteria_passed >= 4 else "B" if criteria_passed >= 3 else "C"
-
-            # 因子評分
-            v_score = 100 if 0 < pe < 15 else 70 if pe < 25 else 40
-            q_score = min(100, max(0, norm_roe * 4))
-            m_score = max(0, min(100, momentum_1y + 20))
-            g_score = max(0, min(100, info.get('revenueGrowth', 0) * 100)) if info.get('revenueGrowth') else 50
+            criteria_passed = sum(1 for v in buffett_criteria.values() if v)
             
-            # 產業加權（巴菲特偏好）
+            # 等級給予更嚴格的定義 (增加 S 級別或更細緻的劃分)
+            buffett_grade = "A+" if criteria_passed == 5 else "A" if criteria_passed == 4 else "B" if criteria_passed == 3 else "C"
+
+            # ==================== 2. 四大因子深度評分 (0-100) ====================
+            
+            # V (Value) 價值評分：本益比越低分越高，但虧損(999)則給 0 分
+            if pe == 999 or pe <= 0:
+                v_score = 0
+            else:
+                v_score = 100 if pe < 12 else 80 if pe < 20 else 50 if pe < 30 else 20
+            
+            # Q (Quality) 品質評分：基於 ROE，巴菲特最愛 20% 以上的公司
+            # 使用更平滑的公式：ROE 25% 拿滿分
+            q_score = min(100, max(0, roe * 4))
+            
+            # M (Momentum) 動能評分：不只是看 1y，應該綜合 6m 和 1y
+            # 加上 50 作為基準分，避免大跌股票出現負分
+            m_score = max(0, min(100, (momentum_1y * 0.4 + momentum_6m * 0.6) + 50))
+            
+            # G (Growth) 成長評分：營收成長是護城河的體現
+            # 預設給 60 分 (合格線)，表現優異者加分
+            rev_growth = info.get('revenueGrowth', 0) * 100
+            g_score = min(100, max(0, rev_growth * 2 + 50)) if rev_growth != 0 else 60
+
+            # ==================== 3. 最終巴菲特總分計算 ====================
+            # 權重分配：品質 (ROE) 40%, 價值 (PE) 30%, 成長 20%, 動能 10%
+            # 這最符合巴菲特「以合理價格買入卓越公司」的理念
+            buffett_score = (q_score * 0.4) + (v_score * 0.3) + (g_score * 0.2) + (m_score * 0.1)
+            
+            # ==================== 1. 產業加權（巴菲特偏好） ====================
             sector_weights = {
-                "金融股": {"quality": 1.2, "value": 1.1},  # 巴菲特最愛
-                "民生消費股": {"quality": 1.1, "value": 1.0},
-                "科技股": {"growth": 1.2, "momentum": 1.1}
+                "金融股": {"quality": 1.15, "value": 1.1},   # 強調穩健與估值
+                "民生消費股": {"quality": 1.1, "value": 1.05},
+                "科技股": {"growth": 1.15, "momentum": 1.05} # 強調成長與動能
             }
             
             weight = sector_weights.get(self.sector, {})
-            v_score *= weight.get("value", 1.0)
-            q_score *= weight.get("quality", 1.0)
-            m_score *= weight.get("momentum", 1.0)
-            g_score *= weight.get("growth", 1.0)
+            # 乘完加權後，使用 min(100, ...) 確保單項分數不會爆表
+            v_score = min(100, v_score * weight.get("value", 1.0))
+            q_score = min(100, q_score * weight.get("quality", 1.0))
+            m_score = min(100, m_score * weight.get("momentum", 1.0))
+            g_score = min(100, g_score * weight.get("growth", 1.0))
 
-            # 綜合評分
+            # ==================== 2. 綜合評分計算 ====================
             buffett_score = (
-                v_score * 0.35 +  # 價值 35%
-                q_score * 0.35 +  # 質量 35%
-                m_score * 0.15 +  # 動能 15%
-                g_score * 0.15    # 成長 15%
+                v_score * 0.35 + 
+                q_score * 0.35 + 
+                m_score * 0.15 + 
+                g_score * 0.15
             )
             
-            # 巴菲特標準加成
+            # 標準加成：如果有通過巴菲特標準，給予獎勵分
             if criteria_passed >= 4:
-                buffett_score *= 1.2
+                buffett_score *= 1.15 # 獎勵 15%
             elif criteria_passed >= 3:
-                buffett_score *= 1.1
+                buffett_score *= 1.05 # 獎勵 5%
 
-            # 最終分數
+            # ==================== 3. 趨勢懲罰與最終分數 ====================
             final_score = buffett_score
+            # 如果動能為負，或者處於空頭趨勢，進行折價（巴菲特不接落下的刀子）
             if not is_positive_momentum:
-                final_score *= 0.7
-            if market_phase == "熊市":
+                final_score *= 0.75 
+            if market_phase == "空頭趨勢":
                 final_score *= 0.85
+            
+            # 確保最終總分在 0-100 之間
+            final_score = max(0, min(100, final_score))
 
-            # 風險評估
-            debt_r = min(100, debt_to_equity / 2) if debt_to_equity else 20
-            val_r = min(100, (pe / 40) * 100)
+            # ==================== 4. 風險評估 (Risk Score) ====================
+            # 債務風險：若 debt_to_equity 為 1.5 代表 150%
+            debt_r = min(100, (debt_to_equity * 50)) if debt_to_equity else 30
+            
+            # 估值風險：PE 越高風險越高，若 PE=999(虧損) 則風險 100
+            val_r = 100 if pe >= 100 else (pe / 40) * 100
+            
+            # 波動風險 (Volatility)：
             returns = hist['Close'].pct_change().dropna()
-            vol_r = returns.std() * np.sqrt(252) * 100 if len(returns) > 0 else 50
-            total_risk = (debt_r + val_r + vol_r) / 3
-
-            # 投資建議
-            if final_score > 80 and criteria_passed >= 4:
-                recommendation = "強力推薦 ⭐⭐⭐"
-            elif final_score > 65 and criteria_passed >= 3:
-                recommendation = "推薦 ⭐⭐"
-            elif final_score > 50:
-                recommendation = "觀察 ⭐"
+            if len(returns) > 20:
+                # 年化波動度
+                vol_r = returns.std() * np.sqrt(252) * 100 
             else:
-                recommendation = "避開"
+                vol_r = 50 # 數據不足給予中等風險
+            
+            # 綜合風險 (0-100)：越低越安全
+            total_risk = min(100, (debt_r * 0.4 + val_r * 0.4 + vol_r * 0.2))
 
-            logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {buffett_score:.1f}, 標準: {criteria_passed}/5, 等級: {buffett_grade}")
+            # ==================== 5. 投資建議系統 ====================
+            # 結合分數與通過的標準數量
+            if final_score > 85 and criteria_passed >= 4:
+                recommendation = "強力推薦 ⭐⭐⭐"
+            elif final_score > 70 and criteria_passed >= 3:
+                recommendation = "優質標的 ⭐⭐"
+            elif final_score > 55:
+                recommendation = "價值觀察 ⭐"
+            else:
+                recommendation = "暫避鋒芒"
+
+            # 確保使用我們最終計算的評分
+            display_score = round(float(final_score), 1)
+
+            # 記錄 Log
+            logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {display_score}, 等級: {buffett_grade}")
 
             return {
                 "symbol": self.symbol,
-                "companyName": company_name,
+                "companyName": company_name if 'company_name' in locals() else self.symbol,
                 "sector": self.sector,
-                "buffettScore": round(float(buffett_score), 1),
+                "buffettScore": display_score,
                 "currentPrice": round(float(current_price), 2),
                 "momentum": round(float(momentum_1y), 2),
                 "totalRisk": round(float(total_risk), 1),
-                "roe": round(float(norm_roe), 2),
-                "pe": round(float(pe), 2),
+                "roe": round(float(roe), 2), # 使用清洗後的 roe
+                "pe": round(float(pe), 2) if pe < 500 else "N/A", # 若虧損顯示 N/A
                 "recommendation": recommendation,
                 "marketPhase": market_phase,
                 "factors": {
-                    "value": int(round(min(100, v_score))),
-                    "quality": int(round(min(100, q_score))),
+                    "value": int(round(v_score)),
+                    "quality": int(round(q_score)),
                     "momentum": int(round(m_score)),
                     "growth": int(round(g_score))
                 },
@@ -329,24 +470,21 @@ class BuffettStockPicker:
                     "grade": buffett_grade,
                     "criteria_passed": criteria_passed,
                     "details": {
-                        "high_roe": f"{'✅' if buffett_criteria['high_roe'] else '❌'} ROE {norm_roe:.1f}% {'≥' if buffett_criteria['high_roe'] else '<'} 15%",
-                        "reasonable_pe": f"{'✅' if buffett_criteria['reasonable_pe'] else '❌'} P/E {pe:.1f} {'≤' if buffett_criteria['reasonable_pe'] else '>'} 25",
-                        "low_debt": f"{'✅' if buffett_criteria['low_debt'] else '❌'} 債務比 {debt_to_equity:.1f}% {'≤' if buffett_criteria['low_debt'] else '>'} 100%",
+                        "high_roe": f"{'✅' if buffett_criteria['high_roe'] else '❌'} ROE {roe:.1f}% {'≥' if buffett_criteria['high_roe'] else '<'} 15%",
+                        "reasonable_pe": f"{'✅' if buffett_criteria['reasonable_pe'] else '❌'} P/E {'N/A' if pe > 500 else f'{pe:.1f}'} {'≤' if buffett_criteria['reasonable_pe'] else '>' if pe < 500 else '(虧損)'} 25",
+                        "low_debt": f"{'✅' if buffett_criteria['low_debt'] else '❌'} 債務比 {debt_to_equity:.1f}% {'≤' if buffett_criteria['low_debt'] else '>'} 1.0",
                         "profitable": f"{'✅' if buffett_criteria['profitable'] else '❌'} 利潤率 {profit_margin:.1f}% {'≥' if buffett_criteria['profitable'] else '<'} 10%",
-                        "positive_momentum": f"{'✅' if buffett_criteria['positive_momentum'] else '❌'} 6個月動能 {momentum_6m:.1f}%"
+                        "positive_momentum": f"{'✅' if buffett_criteria['positive_momentum'] else '❌'} 6個月趨勢 {'正向' if buffett_criteria['positive_momentum'] else '偏弱'}"
                     }
                 },
                 "details": {
                     "ma200": round(float(ma200), 2),
                     "profit_margin": round(float(profit_margin), 2),
-                    "debt_to_equity": round(float(debt_to_equity), 1),
-                    "cached": is_cached
+                    "debt_to_equity": round(float(debt_to_equity), 2),
+                    "momentum_6m": round(float(momentum_6m), 2),
+                    "timestamp": datetime.now().isoformat()
                 }
             }
-            
-        except Exception as e:
-            logger.error(f"❌ {self.symbol} 分析失敗: {str(e)}")
-            return None
 
 # ==================== API 端點 ====================
 
@@ -417,6 +555,8 @@ async def get_stock_pool(
     
     return results
 
+import asyncio # 確保有 import
+
 @app.get("/api/top-25")
 async def get_top_25():
     """
@@ -426,73 +566,166 @@ async def get_top_25():
     
     logger.info("🎯 開始篩選巴菲特 TOP 25 股票池...")
     
-    all_stocks = []
+    # ==================== 修改後的並行分析邏輯 ====================
+    tasks = []
     
-    # 分析所有股票
+    # 1. 建立所有股票的分析任務，但不立即執行
     for sector_name, pool in STOCK_POOLS.items():
-        logger.info(f"📊 分析 {sector_name}...")
-        
+        logger.info(f"📅 已排程分析產業: {sector_name}")
         for symbol in pool["symbols"]:
             picker = BuffettStockPicker(symbol, sector_name)
-            analysis = await picker.analyze()
-            if analysis:
-                all_stocks.append(analysis)
+            # 將協程物件加入清單
+            tasks.append(picker.analyze())
     
-    # 按評分排序
-    all_stocks.sort(key=lambda x: x['buffettScore'], reverse=True)
+    # 2. 同時啟動所有任務 (並行執行)
+    logger.info(f"🚀 啟動並行分析，共 {len(tasks)} 隻股票...")
     
-    # 取前 25 名
+    # asyncio.gather 會同時發送請求，等待所有股票分析完畢
+    results = await asyncio.gather(*tasks)
+    
+    # 3. 過濾掉分析失敗 (None) 的結果並存入 all_stocks
+    all_stocks = [r for r in results if r is not None]
+    
+    logger.info(f"✅ 分析完成，成功獲取 {len(all_stocks)} 隻股票數據")
+    # ============================================================
+    
+    # 1. 按評分排序 (確保 buffettScore 存在，若無則預設為 0)
+    # 使用 .get() 可以防止某隻股票資料殘缺導致程式崩潰
+    all_stocks.sort(key=lambda x: x.get('buffettScore', 0), reverse=True)
+    
+    # 2. 取前 25 名 (如果總數不足 25，這行程式碼也會自動處理，不會報錯)
     top_25 = all_stocks[:25]
     
-    # 統計分析
+    # 3. 檢查是否有資料 (預防性檢查)
+    if not top_25:
+        logger.warning("⚠️ 警告：沒有任何股票分析成功！")
+        # 可以回傳一個空的成功回應，避免前端顯示 Error
+        return {
+            "status": "success",
+            "top_25_stocks": [],
+            "statistics": {
+                "average_score": 0,
+                "average_risk": 0,
+                "high_grade_stocks": 0,
+                "sector_distribution": {}
+            }
+        }
+    
+    # 1. 取得實際取得的股票數量
+    actual_count = len(top_25)
+    
+    # 2. 初始化統計變數
     sectors_count = {}
     total_score = 0
     total_risk = 0
     high_grade_count = 0
     
+    # 3. 進行統計迴圈
     for stock in top_25:
-        sectors_count[stock['sector']] = sectors_count.get(stock['sector'], 0) + 1
-        total_score += stock['buffettScore']
-        total_risk += stock['totalRisk']
-        if stock['buffettCriteria']['grade'] in ['A+', 'A']:
+        # 產業分布統計
+        sector = stock.get('sector', '未知')
+        sectors_count[sector] = sectors_count.get(sector, 0) + 1
+        
+        # 累加分數與風險 (使用 get 預防 Key 缺失)
+        total_score += stock.get('buffettScore', 0)
+        total_risk += stock.get('totalRisk', 0)
+        
+        # 判斷等級 (加入安全導航)
+        criteria = stock.get('buffettCriteria', {})
+        if criteria.get('grade') in ['A+', 'A']:
             high_grade_count += 1
+            
+    # 4. 計算平均值 (使用實際數量作為除數，避免除以零)
+    divisor = actual_count if actual_count > 0 else 1
     
     return {
+        "status": "success",  # 讓前端更容易判斷請求成功
         "title": "巴菲特 TOP 25 股票池",
         "description": "基於價值投資原則篩選的優質股票",
         "total_analyzed": len(all_stocks),
         "top_25_stocks": top_25,
         "statistics": {
-            "average_score": round(total_score / 25, 1),
-            "average_risk": round(total_risk / 25, 1),
+            "average_score": round(total_score / divisor, 1),
+            "average_risk": round(total_risk / divisor, 1),
             "high_grade_stocks": high_grade_count,
-            "sector_distribution": sectors_count
+            "sector_distribution": sectors_count,
+            "count": actual_count  # 回傳實際數量給前端參考
         },
-        "criteria": BuffettStockPicker.BUFFETT_CRITERIA,
+        "criteria": getattr(BuffettStockPicker, 'BUFFETT_CRITERIA', {}),
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/analyze")
 async def analyze_single_stock(
-    symbol: str = Query(..., description="股票代號"),
+    symbol: str = Query(..., description="股票代號，例如: AAPL"),
     sector: str = Query("科技股", description="產業分類")
 ):
-    """單一股票分析"""
-    picker = BuffettStockPicker(symbol.upper(), sector)
-    result = await picker.analyze()
+    """
+    單一股票即時分析
+    """
+    symbol = symbol.upper().strip()
+    logger.info(f"🔍 正在進行單一股票深度分析: {symbol} (產業: {sector})")
     
-    if not result:
-        raise HTTPException(status_code=404, detail=f"{symbol} 分析失敗")
-    
-    return result
+    try:
+        # 1. 初始化分析器
+        picker = BuffettStockPicker(symbol, sector)
+        
+        # 2. 執行分析
+        # 注意：如果你的分析器內部沒有處理異常，這裡可以用 try-except 包起來
+        result = await picker.analyze()
+        
+        # 3. 檢查結果
+        if not result:
+            logger.warning(f"⚠️ {symbol} 分析結果為空，可能是代號錯誤或數據源(Yahoo Finance)無資料")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"無法獲取 {symbol} 的分析數據。請確認代號是否正確，或該公司是否缺少近期的財務報表。"
+            )
+        
+        # 4. 回傳結果並加入成功狀態
+        return {
+            "status": "success",
+            "data": result,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException as http_e:
+        raise http_e
+    except Exception as e:
+        logger.error(f"❌ 分析 {symbol} 時發生非預期錯誤: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"伺服器分析錯誤: {str(e)}"
+        )
+
+import time # 記得在文件上方 import time
+
+# 在檔案頂部定義啟動時間
+START_TIME = time.time()
 
 @app.get("/health")
 async def health_check():
+    """
+    系統健康檢查
+    提供運行狀態、數據規模及伺服器效能資訊
+    """
+    # 計算運行秒數
+    uptime_seconds = int(time.time() - START_TIME)
+    
     return {
         "status": "healthy",
-        "sectors": len(STOCK_POOLS),
-        "total_stocks": sum(len(pool["symbols"]) for pool in STOCK_POOLS.values()),
-        "cache_expire": CACHE_EXPIRE_SECONDS
+        "timestamp": datetime.now().isoformat(),
+        "uptime": f"{uptime_seconds} seconds",
+        "data_info": {
+            "sectors_count": len(STOCK_POOLS),
+            "total_stocks_in_pool": sum(len(pool["symbols"]) for pool in STOCK_POOLS.values()),
+            "monitored_sectors": list(STOCK_POOLS.keys())
+        },
+        "configuration": {
+            "cache_expire_seconds": CACHE_EXPIRE_SECONDS,
+            "timezone": "UTC"
+        },
+        "server_environment": "Render.com" if "RENDER" in os.environ else "local"
     }
 
 if __name__ == "__main__":
