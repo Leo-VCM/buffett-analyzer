@@ -1,7 +1,3 @@
-"""
-Buffett Analyzer API 啟動檔
-用於 Render 部署
-"""
 import uvicorn
 import os
 import sys
