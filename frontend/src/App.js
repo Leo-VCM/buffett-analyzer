@@ -252,7 +252,7 @@ const BuffettStockPicker = () => {
   const [selectedSector, setSelectedSector] = useState(null);
   const [useRealAPI, setUseRealAPI] = useState(false);
 
-  const API_BASE = 'http://localhost:10000';
+  const API_BASE = 'https://buffett-analyzer.onrender.com';
 
   const fetchData = async () => {
     try {
