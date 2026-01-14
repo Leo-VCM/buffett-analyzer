@@ -1,7 +1,3 @@
-"""
-Buffett Stock Picker - 巴菲特選股系統 (每日快取版)
-每天自動計算一次,使用者直接讀取結果,無需等待
-"""
 import os
 import logging
 import random
