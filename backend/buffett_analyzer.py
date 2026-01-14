@@ -1,30 +1,87 @@
 """
-Buffett Stock Picker - 巴菲特選股系統
-按產業分類，篩選出符合巴菲特標準的 25 支股票池
+Buffett Stock Picker - 巴菲特選股系統 (優化版)
+按產業分類,篩選出符合巴菲特標準的 25 支股票池
 """
 import os
 import logging
 import random
 import asyncio
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from datetime import datetime, timedelta
+from functools import lru_cache
+from contextlib import asynccontextmanager
 
 import numpy as np
 import pandas as pd
 import requests_cache
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
+import time
 
-# ==================== 初始化 ====================
+# ==================== 配置管理 ====================
+
+class Config:
+    """集中管理所有配置參數"""
+    # 快取設定
+    CACHE_PATH = "/tmp/yfinance_stock_cache"
+    CACHE_EXPIRE_SECONDS = int(os.environ.get("CACHE_EXPIRE", 3600))
+    
+    # 速率限制
+    MAX_REQUESTS_PER_MINUTE = 20  # 提高到 20
+    MIN_REQUEST_DELAY = 0.2  # 降低延遲
+    
+    # 資料要求
+    MIN_HISTORY_DAYS = 20
+    MIN_INFO_FIELDS = 5
+    
+    # 並行控制
+    MAX_CONCURRENT_REQUESTS = 10  # 限制同時並行數
+    
+    # API 設定
+    API_TITLE = "Buffett Stock Picker API"
+    API_VERSION = "3.1"
+    API_DESCRIPTION = "巴菲特選股系統 - 三大產業股票池分析 (優化版)"
+
+config = Config()
+
+# ==================== 日誌配置 ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== 快取與啟動管理 ====================
+
+session = requests_cache.CachedSession(
+    config.CACHE_PATH,
+    expire_after=config.CACHE_EXPIRE_SECONDS,
+    backend='sqlite'
+)
+
+START_TIME = time.time()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """應用生命週期管理"""
+    logger.info("🚀 巴菲特選股系統啟動中...")
+    logger.info(f"📊 快取過期時間: {config.CACHE_EXPIRE_SECONDS}秒")
+    yield
+    logger.info("👋 系統正在關閉...")
+
+# ==================== FastAPI 初始化 ====================
 
 app = FastAPI(
-    title="Buffett Stock Picker API", 
-    version="3.0",
-    description="巴菲特選股系統 - 三大產業股票池分析",
+    title=config.API_TITLE,
+    version=config.API_VERSION,
+    description=config.API_DESCRIPTION,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -35,109 +92,106 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# 快取設定
-cache_path = "/tmp/yfinance_stock_cache"
-CACHE_EXPIRE_SECONDS = int(os.environ.get("CACHE_EXPIRE", 3600))
-session = requests_cache.CachedSession(
-    cache_path, 
-    expire_after=CACHE_EXPIRE_SECONDS, 
-    backend='sqlite'
-)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # ==================== 股票池定義 ====================
 
 STOCK_POOLS = {
     "科技股": {
         "description": "科技創新類股票",
         "symbols": [
-            # 大型科技股
             "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD",
-            # 軟體與雲端
             "CRM", "ADBE", "ORCL", "SAP", "SNOW", "PLTR",
-            # 半導體
             "INTC", "QCOM", "AVGO", "TSM", "ASML",
-            # 電商與網路
             "BABA", "JD", "SHOP", "SE"
         ]
     },
     "金融股": {
         "description": "銀行、保險與金融服務",
         "symbols": [
-            # 銀行
             "JPM", "BAC", "WFC", "C", "GS", "MS", "USB", "PNC",
-            # 保險
             "BRK.B", "AIG", "MET", "PRU", "AFL", "ALL",
-            # 金融科技
             "V", "MA", "PYPL", "SQ", "AXP",
-            # 資產管理
             "BLK", "SCHW", "BX", "KKR"
         ]
     },
     "民生消費股": {
         "description": "日常消費與零售",
         "symbols": [
-            # 零售
             "WMT", "HD", "COST", "TGT", "LOW", "TJX",
-            # 食品飲料
             "KO", "PEP", "MDLZ", "KHC", "GIS", "K",
-            # 餐飲
             "MCD", "SBUX", "YUM", "CMG", "QSR",
-            # 日用品
             "PG", "UL", "CL", "KMB", "CLX",
-            # 醫療保健
             "JNJ", "PFE", "UNH"
         ]
     }
 }
 
-# ==================== 速率限制器 ====================
+# ==================== 優化的速率限制器 ====================
 
 class RateLimiter:
+    """改進的速率限制器,支援並行控制"""
+    
     def __init__(self):
         self.requests = []
-        self.max_requests_per_minute = 15  # 提高到15次
-        self.min_delay_between_requests = 0.3
+        self.semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
         
-    def can_make_request(self) -> bool:
+    def _clean_old_requests(self):
+        """清理過期的請求記錄"""
         now = datetime.now()
-        self.requests = [req for req in self.requests if now - req < timedelta(minutes=1)]
-        return len(self.requests) < self.max_requests_per_minute
+        self.requests = [
+            req for req in self.requests 
+            if now - req < timedelta(minutes=1)
+        ]
+    
+    def can_make_request(self) -> bool:
+        """檢查是否可以發送請求"""
+        self._clean_old_requests()
+        return len(self.requests) < config.MAX_REQUESTS_PER_MINUTE
     
     def record_request(self):
+        """記錄請求時間"""
         self.requests.append(datetime.now())
     
     async def wait_if_needed(self):
+        """智能等待機制"""
         wait_count = 0
         while not self.can_make_request():
             wait_count += 1
             if wait_count == 1:
-                logger.warning("⚠️ 達到速率限制，等待中...")
-            await asyncio.sleep(5)
-        await asyncio.sleep(self.min_delay_between_requests)
+                logger.warning("⚠️ 達到速率限制,等待中...")
+            await asyncio.sleep(3)  # 縮短等待時間
+        
+        # 添加隨機延遲避免突發請求
+        await asyncio.sleep(random.uniform(0.1, config.MIN_REQUEST_DELAY))
 
 rate_limiter = RateLimiter()
 
-# ==================== 數據模型 ====================
+# ==================== 數據模型 (增強驗證) ====================
 
 class StockAnalysis(BaseModel):
     symbol: str
     companyName: str
-    sector: str  # 產業分類
-    buffettScore: float
-    currentPrice: float
+    sector: str
+    buffettScore: float = Field(ge=0, le=100)
+    currentPrice: float = Field(gt=0)
     momentum: float
-    totalRisk: float
+    totalRisk: float = Field(ge=0, le=100)
     roe: float
-    pe: float
+    pe: float | str
     recommendation: str
     marketPhase: str
-    factors: dict
-    risks: dict
-    buffettCriteria: dict  # 巴菲特標準評估
-    details: dict
+    factors: Dict[str, int]
+    risks: Dict[str, float]
+    buffettCriteria: Dict
+    details: Dict
+    
+    @validator('pe')
+    def validate_pe(cls, v):
+        """驗證 P/E 值"""
+        if isinstance(v, str):
+            return v
+        if v < 0:
+            return "N/A"
+        return v
 
 class SectorAnalysis(BaseModel):
     sector: str
@@ -146,376 +200,398 @@ class SectorAnalysis(BaseModel):
     analyzed_stocks: int
     top_picks: List[StockAnalysis]
     average_score: float
+    average_risk: float
     sector_risk: str
 
-# ==================== 巴菲特選股引擎 ====================
+# ==================== 資料獲取優化 ====================
+
+class DataFetcher:
+    """優化的資料獲取器"""
+    
+    @staticmethod
+    async def fetch_stock_data(symbol: str) -> Tuple[Optional[dict], Optional[pd.DataFrame]]:
+        """非同步獲取股票資料,帶重試機制"""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                stock = yf.Ticker(symbol, session=session)
+                
+                # 使用 fast_info 作為備選方案
+                try:
+                    info = stock.info
+                except Exception:
+                    logger.warning(f"⚠️ {symbol}: info 失敗,嘗試 fast_info")
+                    info = stock.fast_info.__dict__ if hasattr(stock, 'fast_info') else {}
+                
+                # 獲取歷史數據
+                hist = stock.history(period="1y", auto_adjust=True)
+                
+                # 驗證數據完整性
+                if not info or len(info) < config.MIN_INFO_FIELDS:
+                    logger.warning(f"❌ {symbol}: 基本面資料不足")
+                    return None, None
+                
+                if hist.empty or len(hist) < config.MIN_HISTORY_DAYS:
+                    logger.warning(f"❌ {symbol}: 歷史數據不足")
+                    return None, None
+                
+                return info, hist
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ {symbol}: 第{attempt + 1}次嘗試失敗,重試中... ({e})")
+                    await asyncio.sleep(1)
+                else:
+                    logger.error(f"❌ {symbol}: 所有嘗試失敗 - {e}")
+                    return None, None
+    
+    @staticmethod
+    def normalize_financial_metrics(info: dict) -> Dict[str, float]:
+        """標準化財務指標"""
+        # ROE 處理
+        raw_roe = info.get('returnOnEquity')
+        roe = (raw_roe * 100 if raw_roe and abs(raw_roe) < 1 else raw_roe) if raw_roe else 0
+        
+        # P/E 處理
+        pe = info.get('forwardPE') or info.get('trailingPE')
+        pe = min(pe, 500) if pe and pe > 0 else 999
+        
+        # 淨利率
+        margin = info.get('profitMargins')
+        profit_margin = (margin * 100) if margin else 0
+        
+        # 債務權益比
+        raw_d_e = info.get('debtToEquity')
+        debt_to_equity = (raw_d_e if raw_d_e < 5 else raw_d_e / 100) if raw_d_e else 2.0
+        
+        # 營收成長
+        rev_growth = (info.get('revenueGrowth', 0) or 0) * 100
+        
+        return {
+            'roe': roe,
+            'pe': pe,
+            'profit_margin': profit_margin,
+            'debt_to_equity': debt_to_equity,
+            'revenue_growth': rev_growth
+        }
+
+# ==================== 巴菲特選股引擎 (優化版) ====================
 
 class BuffettStockPicker:
-    """巴菲特選股引擎 - 基於價值投資原則"""
+    """優化的巴菲特選股引擎"""
     
-    # 巴菲特的核心標準定義
     BUFFETT_CRITERIA = {
-        "roe": {
-            "threshold": 15, 
-            "label": "股東權益報酬率 (ROE)",
-            "unit": "%",
-            "operator": ">="
-        },
-        "pe": {
-            "threshold": 25, 
-            "label": "本益比 (P/E)",
-            "unit": "",
-            "operator": "<="
-        },
-        "debt_to_equity": {
-            "threshold": 1.0, # 財報通常用比率，100% = 1.0
-            "label": "債務權益比",
-            "unit": "",
-            "operator": "<="
-        },
-        "profit_margin": {
-            "threshold": 10, 
-            "label": "淨利率",
-            "unit": "%",
-            "operator": ">="
-        },
-        "consistent_earnings": {
-            "required": True,
-            "label": "獲利穩定度",
-            "description": "過去 3-5 年連續盈利"
-        },
-        "moat": {
-            "required": True,
-            "label": "經濟護城河",
-            "description": "品牌影響力或市場獨佔地位"
-        }
+        "roe": {"threshold": 15, "label": "股東權益報酬率 (ROE)", "unit": "%", "operator": ">="},
+        "pe": {"threshold": 25, "label": "本益比 (P/E)", "unit": "", "operator": "<="},
+        "debt_to_equity": {"threshold": 1.0, "label": "債務權益比", "unit": "", "operator": "<="},
+        "profit_margin": {"threshold": 10, "label": "淨利率", "unit": "%", "operator": ">="},
+    }
+    
+    SECTOR_WEIGHTS = {
+        "金融股": {"quality": 1.15, "value": 1.1},
+        "民生消費股": {"quality": 1.1, "value": 1.05},
+        "科技股": {"growth": 1.15, "momentum": 1.05}
     }
     
     def __init__(self, symbol: str, sector: str):
         self.symbol = symbol.upper()
         self.sector = sector
-        self.stock = yf.Ticker(self.symbol, session=session)
-
-    def is_cached(self) -> bool:
-        cache_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{self.symbol}"
-        return session.cache.has_url(cache_url)
-
-    async def analyze(self) -> Optional[dict]:
-        """完整分析股票"""
+        self.data_fetcher = DataFetcher()
+    
+    def _calculate_momentum(self, hist: pd.DataFrame, current_price: float) -> Dict[str, float]:
+        """計算多時間框架動能"""
         try:
-            is_cached = self.is_cached()
+            momentum = {}
             
-            if not is_cached:
-                logger.info(f"🔍 {self.symbol} ({self.sector}) 未快取")
-                await rate_limiter.wait_if_needed()
-                rate_limiter.record_request()
-                await asyncio.sleep(random.uniform(0.2, 0.8))
-            else:
-                logger.info(f"✅ {self.symbol} ({self.sector}) 使用快取")
-
-            # ==================== 優化後的獲取數據 ====================
-            try:
-                # 1. 建議先檢查 ticker 是否有效
-                # info 獲取非常緩慢且容易失敗，可以考慮使用 fast_info 作為備選
-                info = self.stock.info
+            # 確保有足夠的資料
+            if len(hist) < 21:
+                return {'1y': 0, '6m': 0, '1m': 0}
+            
+            # 一年動能
+            one_year_ago = hist['Close'].iloc[0]
+            momentum['1y'] = ((current_price - one_year_ago) / one_year_ago) * 100
+            
+            # 六個月動能
+            half_year_idx = max(0, len(hist) // 2)
+            six_months_ago = hist['Close'].iloc[half_year_idx]
+            momentum['6m'] = ((current_price - six_months_ago) / six_months_ago) * 100
+            
+            # 一個月動能
+            one_month_idx = max(0, len(hist) - 21)
+            one_month_ago = hist['Close'].iloc[one_month_idx]
+            momentum['1m'] = ((current_price - one_month_ago) / one_month_ago) * 100
+            
+            return momentum
+            
+        except Exception as e:
+            logger.warning(f"⚠️ {self.symbol} 動能計算失敗: {e}")
+            return {'1y': 0, '6m': 0, '1m': 0}
+    
+    def _calculate_technical_indicators(self, hist: pd.DataFrame) -> Dict[str, float]:
+        """計算技術指標"""
+        ma200 = hist['Close'].rolling(window=200, min_periods=1).mean().iloc[-1]
+        ma50 = hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1]
+        
+        return {
+            'ma200': ma200,
+            'ma50': ma50
+        }
+    
+    def _assess_market_phase(self, current_price: float, ma200: float, ma50: float) -> str:
+        """評估市場階段"""
+        if current_price > ma200:
+            return "多頭排列" if current_price > ma50 else "高檔震盪"
+        else:
+            return "空頭趨勢" if current_price < ma50 else "低檔打底"
+    
+    def _calculate_factor_scores(self, metrics: dict, momentum: dict) -> Dict[str, int]:
+        """計算四大因子評分"""
+        pe = metrics['pe']
+        roe = metrics['roe']
+        rev_growth = metrics['revenue_growth']
+        
+        # Value Score
+        v_score = 0 if pe >= 999 else (
+            100 if pe < 12 else 80 if pe < 20 else 50 if pe < 30 else 20
+        )
+        
+        # Quality Score
+        q_score = min(100, max(0, roe * 4))
+        
+        # Momentum Score
+        m_score = max(0, min(100, (momentum['1y'] * 0.4 + momentum['6m'] * 0.6) + 50))
+        
+        # Growth Score
+        g_score = min(100, max(0, rev_growth * 2 + 50)) if rev_growth != 0 else 60
+        
+        # 應用產業權重
+        weight = self.SECTOR_WEIGHTS.get(self.sector, {})
+        v_score = min(100, v_score * weight.get("value", 1.0))
+        q_score = min(100, q_score * weight.get("quality", 1.0))
+        m_score = min(100, m_score * weight.get("momentum", 1.0))
+        g_score = min(100, g_score * weight.get("growth", 1.0))
+        
+        return {
+            'value': int(round(v_score)),
+            'quality': int(round(q_score)),
+            'momentum': int(round(m_score)),
+            'growth': int(round(g_score))
+        }
+    
+    def _calculate_buffett_score(
+        self, 
+        factor_scores: dict, 
+        criteria_passed: int, 
+        is_positive_momentum: bool,
+        market_phase: str
+    ) -> float:
+        """計算最終巴菲特評分"""
+        # 基礎評分
+        base_score = (
+            factor_scores['value'] * 0.35 +
+            factor_scores['quality'] * 0.35 +
+            factor_scores['momentum'] * 0.15 +
+            factor_scores['growth'] * 0.15
+        )
+        
+        # 標準加成
+        if criteria_passed >= 4:
+            base_score *= 1.15
+        elif criteria_passed >= 3:
+            base_score *= 1.05
+        
+        # 趨勢調整
+        final_score = base_score
+        if not is_positive_momentum:
+            final_score *= 0.75
+        if market_phase == "空頭趨勢":
+            final_score *= 0.85
+        
+        return max(0, min(100, final_score))
+    
+    def _calculate_risk_score(
+        self, 
+        metrics: dict, 
+        hist: pd.DataFrame
+    ) -> Tuple[float, Dict[str, float]]:
+        """計算風險評分"""
+        # 債務風險
+        debt_r = min(100, metrics['debt_to_equity'] * 50)
+        
+        # 估值風險
+        pe = metrics['pe']
+        val_r = 100 if pe >= 100 else (pe / 40) * 100
+        
+        # 波動風險
+        returns = hist['Close'].pct_change().dropna()
+        vol_r = (returns.std() * np.sqrt(252) * 100) if len(returns) > 20 else 50
+        
+        # 綜合風險
+        total_risk = min(100, debt_r * 0.4 + val_r * 0.4 + vol_r * 0.2)
+        
+        return total_risk, {
+            'debt': round(debt_r, 1),
+            'valuation': round(val_r, 1),
+            'volatility': round(vol_r, 1)
+        }
+    
+    async def analyze(self) -> Optional[dict]:
+        """執行完整分析"""
+        try:
+            # 控制並行數量
+            async with rate_limiter.semaphore:
+                # 檢查快取
+                is_cached = session.cache.has_url(
+                    f"https://query2.finance.yahoo.com/v8/finance/chart/{self.symbol}"
+                )
                 
-                # 2. 歷史數據抓取 
-                # 加入 auto_adjust=True 確保股價經過還原（考慮除權息）
-                hist = self.stock.history(period="1y", auto_adjust=True)
+                if not is_cached:
+                    await rate_limiter.wait_if_needed()
+                    rate_limiter.record_request()
                 
-            except Exception as e:
-                # 捕捉特定錯誤，避免因為某一隻股票崩潰導致整個併發任務失敗
-                logger.error(f"❌ {self.symbol}: 數據獲取發生異常 - {str(e)}")
-                return None
-            
-            # 3. 數據完整性檢查
-            # 檢查 info 是否為空，或是否只是一個錯誤訊息字典
-            if not info or len(info) < 5: 
-                logger.warning(f"❌ {self.symbol}: 無法獲取公司基本面資料 (Info 為空)")
-                return None
-            
-            if hist.empty or len(hist) < 20: # 寬鬆一點，有時新上市股票天數較少
-                logger.warning(f"❌ {self.symbol}: 股價歷史數據不足")
-                return None
-
-            # 基本資訊
-            company_name = info.get('longName') or info.get('shortName') or self.symbol
-            current_price = (
-                info.get('currentPrice') or 
-                info.get('regularMarketPrice') or 
-                hist['Close'].iloc[-1]
-            )
-            
-            if not current_price or current_price <= 0:
-                return None
-
-            # ==================== 財務指標清洗與標準化 ====================
-            
-            # 1. ROE 處理 (yfinance 通常給 0.15 代表 15%)
-            raw_roe = info.get('returnOnEquity')
-            if raw_roe is not None:
-                # 自動偵測：如果是 0.15 轉為 15；如果是 15 則維持 15
-                roe = raw_roe * 100 if abs(raw_roe) < 1 else raw_roe
-            else:
-                roe = 0  # 缺失值設為 0，評分時會反映出數據不足
+                # 獲取資料
+                info, hist = await self.data_fetcher.fetch_stock_data(self.symbol)
                 
-            # 2. P/E 處理 (本益比)
-            # 優先順序：預估 P/E > 滾動 P/E
-            pe = info.get('forwardPE') or info.get('trailingPE')
-            if pe is None or pe <= 0:
-                pe = 999  # 使用極大值而非 25，因為 P/E 越小越好，999 代表「極不推薦」
-            else:
-                pe = min(pe, 500)  # 限制上限，避免極端數值破壞圖表
+                if not info or hist is None:
+                    return None
                 
-            # 3. 淨利率 (Profit Margin)
-            # yfinance 的 profitMargins 幾乎都是小數 (例如 0.2 = 20%)
-            margin = info.get('profitMargins')
-            profit_margin = (margin * 100) if margin is not None else 0
-            
-            # 4. 債務權益比 (Debt to Equity)
-            # 注意：yfinance 有些回傳 100 代表 100%，有些回傳 1.0
-            raw_d_e = info.get('debtToEquity')
-            if raw_d_e is not None:
-                debt_to_equity = raw_d_e if raw_d_e < 5 else raw_d_e / 100
-            else:
-                debt_to_equity = 2.0  # 缺失值預設為較高風險 (200%)
-            
-            # ==================== 市場分析與趨勢判斷 ====================
-            
-            # 1. 計算 MA200 (長期趨勢線)
-            # 使用 min_periods=1 確保數據不足 200 天時也能計算出平均值，不至於報錯
-            ma200_series = hist['Close'].rolling(window=200, min_periods=1).mean()
-            ma200 = ma200_series.iloc[-1]
-            
-            # 2. 計算 MA50 (中期趨勢線，巴菲特也看重中期支撐)
-            ma50 = hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1]
-            
-            # 3. 更精準的市場階段判斷 (Market Phase)
-            # 對於單一股票，我們通常看它是處於「上升通道」還是「修正階段」
-            if current_price > ma200:
-                market_phase = "多頭排列" if current_price > ma50 else "高檔震盪"
-            else:
-                market_phase = "空頭趨勢" if current_price < ma50 else "低檔打底"
-            
-            # 4. 計算價格偏離度 (與 MA200 的距離)
-            # 這是風險評估的重要指標：如果股價高於 MA200 太多，可能代表過熱
-            price_deviation = ((current_price - ma200) / ma200) * 100
-            
-            # ==================== 動能與趨勢強度分析 ====================
-            
-            # 1. 一年動能 (Momentum 1Y)
-            # 使用 try-except 確保數據量極少時不會 index out of bounds
-            try:
-                one_year_ago = hist['Close'].iloc[0]
-                momentum_1y = ((current_price - one_year_ago) / one_year_ago) * 100
+                # 基本資訊
+                company_name = info.get('longName') or info.get('shortName') or self.symbol
+                current_price = (
+                    info.get('currentPrice') or
+                    info.get('regularMarketPrice') or
+                    hist['Close'].iloc[-1]
+                )
                 
-                # 2. 六個月動能 (Momentum 6M)
-                # 使用 len(hist)//2 或是精確找 126 個交易日
-                half_year_idx = len(hist) // 2
-                six_months_ago = hist['Close'].iloc[half_year_idx]
-                momentum_6m = ((current_price - six_months_ago) / six_months_ago) * 100
+                if not current_price or current_price <= 0:
+                    return None
                 
-                # 3. 短期強勢 (1個月動能) - 巴菲特雖看長，但進場看短
-                one_month_idx = max(0, len(hist) - 21)
-                one_month_ago = hist['Close'].iloc[one_month_idx]
-                momentum_1m = ((current_price - one_month_ago) / one_month_ago) * 100
+                # 標準化財務指標
+                metrics = self.data_fetcher.normalize_financial_metrics(info)
                 
-            except Exception as e:
-                logger.warning(f"⚠️ {self.symbol} 動能計算失敗: {e}")
-                momentum_1y, momentum_6m, momentum_1m = 0, 0, 0
-
-            # 4. 動能狀態判斷
-            # 好的價值股應該是：長期低估 + 中短期動能轉強
-            is_positive_momentum = momentum_6m > 0 and momentum_1m > -5
-
-            # ==================== 1. 巴菲特標準檢查 (布林值) ====================
-            buffett_criteria = {
-                "high_roe": roe >= self.BUFFETT_CRITERIA["roe"]["threshold"],
-                "reasonable_pe": 0 < pe <= self.BUFFETT_CRITERIA["pe"]["threshold"],
-                # 注意：debt_to_equity 在清洗時已標準化，此處判斷應與閾值一致
-                "low_debt": debt_to_equity <= (self.BUFFETT_CRITERIA["debt_to_equity"]["threshold"]),
-                "profitable": profit_margin >= self.BUFFETT_CRITERIA["profit_margin"]["threshold"],
-                "positive_momentum": is_positive_momentum
-            }
-            
-            criteria_passed = sum(1 for v in buffett_criteria.values() if v)
-            
-            # 等級給予更嚴格的定義 (增加 S 級別或更細緻的劃分)
-            buffett_grade = "A+" if criteria_passed == 5 else "A" if criteria_passed == 4 else "B" if criteria_passed == 3 else "C"
-
-            # ==================== 2. 四大因子深度評分 (0-100) ====================
-            
-            # V (Value) 價值評分：本益比越低分越高，但虧損(999)則給 0 分
-            if pe == 999 or pe <= 0:
-                v_score = 0
-            else:
-                v_score = 100 if pe < 12 else 80 if pe < 20 else 50 if pe < 30 else 20
-            
-            # Q (Quality) 品質評分：基於 ROE，巴菲特最愛 20% 以上的公司
-            # 使用更平滑的公式：ROE 25% 拿滿分
-            q_score = min(100, max(0, roe * 4))
-            
-            # M (Momentum) 動能評分：不只是看 1y，應該綜合 6m 和 1y
-            # 加上 50 作為基準分，避免大跌股票出現負分
-            m_score = max(0, min(100, (momentum_1y * 0.4 + momentum_6m * 0.6) + 50))
-            
-            # G (Growth) 成長評分：營收成長是護城河的體現
-            # 預設給 60 分 (合格線)，表現優異者加分
-            rev_growth = info.get('revenueGrowth', 0) * 100
-            g_score = min(100, max(0, rev_growth * 2 + 50)) if rev_growth != 0 else 60
-
-            # ==================== 3. 最終巴菲特總分計算 ====================
-            # 權重分配：品質 (ROE) 40%, 價值 (PE) 30%, 成長 20%, 動能 10%
-            # 這最符合巴菲特「以合理價格買入卓越公司」的理念
-            buffett_score = (q_score * 0.4) + (v_score * 0.3) + (g_score * 0.2) + (m_score * 0.1)
-            
-            # ==================== 1. 產業加權（巴菲特偏好） ====================
-            sector_weights = {
-                "金融股": {"quality": 1.15, "value": 1.1},   # 強調穩健與估值
-                "民生消費股": {"quality": 1.1, "value": 1.05},
-                "科技股": {"growth": 1.15, "momentum": 1.05} # 強調成長與動能
-            }
-            
-            weight = sector_weights.get(self.sector, {})
-            # 乘完加權後，使用 min(100, ...) 確保單項分數不會爆表
-            v_score = min(100, v_score * weight.get("value", 1.0))
-            q_score = min(100, q_score * weight.get("quality", 1.0))
-            m_score = min(100, m_score * weight.get("momentum", 1.0))
-            g_score = min(100, g_score * weight.get("growth", 1.0))
-
-            # ==================== 2. 綜合評分計算 ====================
-            buffett_score = (
-                v_score * 0.35 + 
-                q_score * 0.35 + 
-                m_score * 0.15 + 
-                g_score * 0.15
-            )
-            
-            # 標準加成：如果有通過巴菲特標準，給予獎勵分
-            if criteria_passed >= 4:
-                buffett_score *= 1.15 # 獎勵 15%
-            elif criteria_passed >= 3:
-                buffett_score *= 1.05 # 獎勵 5%
-
-            # ==================== 3. 趨勢懲罰與最終分數 ====================
-            final_score = buffett_score
-            # 如果動能為負，或者處於空頭趨勢，進行折價（巴菲特不接落下的刀子）
-            if not is_positive_momentum:
-                final_score *= 0.75 
-            if market_phase == "空頭趨勢":
-                final_score *= 0.85
-            
-            # 確保最終總分在 0-100 之間
-            final_score = max(0, min(100, final_score))
-
-            # ==================== 4. 風險評估 (Risk Score) ====================
-            # 債務風險：若 debt_to_equity 為 1.5 代表 150%
-            debt_r = min(100, (debt_to_equity * 50)) if debt_to_equity else 30
-            
-            # 估值風險：PE 越高風險越高，若 PE=999(虧損) 則風險 100
-            val_r = 100 if pe >= 100 else (pe / 40) * 100
-            
-            # 波動風險 (Volatility)：
-            returns = hist['Close'].pct_change().dropna()
-            if len(returns) > 20:
-                # 年化波動度
-                vol_r = returns.std() * np.sqrt(252) * 100 
-            else:
-                vol_r = 50 # 數據不足給予中等風險
-            
-            # 綜合風險 (0-100)：越低越安全
-            total_risk = min(100, (debt_r * 0.4 + val_r * 0.4 + vol_r * 0.2))
-
-            # ==================== 5. 投資建議系統 ====================
-            # 結合分數與通過的標準數量
-            if final_score > 85 and criteria_passed >= 4:
-                recommendation = "強力推薦 ⭐⭐⭐"
-            elif final_score > 70 and criteria_passed >= 3:
-                recommendation = "優質標的 ⭐⭐"
-            elif final_score > 55:
-                recommendation = "價值觀察 ⭐"
-            else:
-                recommendation = "暫避鋒芒"
-
-            # 確保使用我們最終計算的評分
-            display_score = round(float(final_score), 1)
-
-            # 記錄 Log
-            logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {display_score}, 等級: {buffett_grade}")
-
-            return {
-                "symbol": self.symbol,
-                "companyName": company_name if 'company_name' in locals() else self.symbol,
-                "sector": self.sector,
-                "buffettScore": display_score,
-                "currentPrice": round(float(current_price), 2),
-                "momentum": round(float(momentum_1y), 2),
-                "totalRisk": round(float(total_risk), 1),
-                "roe": round(float(roe), 2), # 使用清洗後的 roe
-                "pe": round(float(pe), 2) if pe < 500 else "N/A", # 若虧損顯示 N/A
-                "recommendation": recommendation,
-                "marketPhase": market_phase,
-                "factors": {
-                    "value": int(round(v_score)),
-                    "quality": int(round(q_score)),
-                    "momentum": int(round(m_score)),
-                    "growth": int(round(g_score))
-                },
-                "risks": {
-                    "debt": round(float(debt_r), 1),
-                    "valuation": round(float(val_r), 1),
-                    "volatility": round(float(vol_r), 1)
-                },
-                "buffettCriteria": {
-                    "grade": buffett_grade,
-                    "criteria_passed": criteria_passed,
-                    "details": {
-                        "high_roe": f"{'✅' if buffett_criteria['high_roe'] else '❌'} ROE {roe:.1f}% {'≥' if buffett_criteria['high_roe'] else '<'} 15%",
-                        "reasonable_pe": f"{'✅' if buffett_criteria['reasonable_pe'] else '❌'} P/E {'N/A' if pe > 500 else f'{pe:.1f}'} {'≤' if buffett_criteria['reasonable_pe'] else '>' if pe < 500 else '(虧損)'} 25",
-                        "low_debt": f"{'✅' if buffett_criteria['low_debt'] else '❌'} 債務比 {debt_to_equity:.1f}% {'≤' if buffett_criteria['low_debt'] else '>'} 1.0",
-                        "profitable": f"{'✅' if buffett_criteria['profitable'] else '❌'} 利潤率 {profit_margin:.1f}% {'≥' if buffett_criteria['profitable'] else '<'} 10%",
-                        "positive_momentum": f"{'✅' if buffett_criteria['positive_momentum'] else '❌'} 6個月趨勢 {'正向' if buffett_criteria['positive_momentum'] else '偏弱'}"
-                    }
-                },
-                "details": {
-                    "ma200": round(float(ma200), 2),
-                    "profit_margin": round(float(profit_margin), 2),
-                    "debt_to_equity": round(float(debt_to_equity), 2),
-                    "momentum_6m": round(float(momentum_6m), 2),
-                    "timestamp": datetime.now().isoformat()
+                # 計算動能
+                momentum = self._calculate_momentum(hist, current_price)
+                
+                # 技術指標
+                tech_indicators = self._calculate_technical_indicators(hist)
+                
+                # 市場階段
+                market_phase = self._assess_market_phase(
+                    current_price, 
+                    tech_indicators['ma200'], 
+                    tech_indicators['ma50']
+                )
+                
+                # 巴菲特標準檢查
+                is_positive_momentum = momentum['6m'] > 0 and momentum['1m'] > -5
+                
+                buffett_criteria = {
+                    "high_roe": metrics['roe'] >= self.BUFFETT_CRITERIA["roe"]["threshold"],
+                    "reasonable_pe": 0 < metrics['pe'] <= self.BUFFETT_CRITERIA["pe"]["threshold"],
+                    "low_debt": metrics['debt_to_equity'] <= self.BUFFETT_CRITERIA["debt_to_equity"]["threshold"],
+                    "profitable": metrics['profit_margin'] >= self.BUFFETT_CRITERIA["profit_margin"]["threshold"],
+                    "positive_momentum": is_positive_momentum
                 }
-            }
+                
+                criteria_passed = sum(1 for v in buffett_criteria.values() if v)
+                buffett_grade = (
+                    "A+" if criteria_passed == 5 else
+                    "A" if criteria_passed == 4 else
+                    "B" if criteria_passed == 3 else "C"
+                )
+                
+                # 計算因子評分
+                factor_scores = self._calculate_factor_scores(metrics, momentum)
+                
+                # 計算最終評分
+                final_score = self._calculate_buffett_score(
+                    factor_scores,
+                    criteria_passed,
+                    is_positive_momentum,
+                    market_phase
+                )
+                
+                # 風險評估
+                total_risk, risk_breakdown = self._calculate_risk_score(metrics, hist)
+                
+                # 投資建議
+                recommendation = (
+                    "強力推薦 ⭐⭐⭐" if final_score > 85 and criteria_passed >= 4 else
+                    "優質標的 ⭐⭐" if final_score > 70 and criteria_passed >= 3 else
+                    "價值觀察 ⭐" if final_score > 55 else "暫避鋒芒"
+                )
+                
+                logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {final_score:.1f}, 等級: {buffett_grade}")
+                
+                return {
+                    "symbol": self.symbol,
+                    "companyName": company_name,
+                    "sector": self.sector,
+                    "buffettScore": round(float(final_score), 1),
+                    "currentPrice": round(float(current_price), 2),
+                    "momentum": round(float(momentum['1y']), 2),
+                    "totalRisk": round(float(total_risk), 1),
+                    "roe": round(float(metrics['roe']), 2),
+                    "pe": round(float(metrics['pe']), 2) if metrics['pe'] < 500 else "N/A",
+                    "recommendation": recommendation,
+                    "marketPhase": market_phase,
+                    "factors": factor_scores,
+                    "risks": risk_breakdown,
+                    "buffettCriteria": {
+                        "grade": buffett_grade,
+                        "criteria_passed": criteria_passed,
+                        "details": {
+                            "high_roe": f"{'✅' if buffett_criteria['high_roe'] else '❌'} ROE {metrics['roe']:.1f}% {'≥' if buffett_criteria['high_roe'] else '<'} 15%",
+                            "reasonable_pe": f"{'✅' if buffett_criteria['reasonable_pe'] else '❌'} P/E {'N/A' if metrics['pe'] > 500 else f'{metrics['pe']:.1f}'} {'≤' if buffett_criteria['reasonable_pe'] else '>'} 25",
+                            "low_debt": f"{'✅' if buffett_criteria['low_debt'] else '❌'} 債務比 {metrics['debt_to_equity']:.2f} {'≤' if buffett_criteria['low_debt'] else '>'} 1.0",
+                            "profitable": f"{'✅' if buffett_criteria['profitable'] else '❌'} 利潤率 {metrics['profit_margin']:.1f}% {'≥' if buffett_criteria['profitable'] else '<'} 10%",
+                            "positive_momentum": f"{'✅' if buffett_criteria['positive_momentum'] else '❌'} 6個月趨勢 {'正向' if buffett_criteria['positive_momentum'] else '偏弱'}"
+                        }
+                    },
+                    "details": {
+                        "ma200": round(float(tech_indicators['ma200']), 2),
+                        "profit_margin": round(float(metrics['profit_margin']), 2),
+                        "debt_to_equity": round(float(metrics['debt_to_equity']), 2),
+                        "momentum_6m": round(float(momentum['6m']), 2),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ {self.symbol} 分析失敗: {e}")
+            return None
 
 # ==================== API 端點 ====================
 
 @app.get("/")
 async def root():
+    """API 根端點"""
     return {
-        "service": "Buffett Stock Picker API",
-        "version": "3.0",
-        "description": "巴菲特選股系統 - 三大產業股票池分析",
+        "service": config.API_TITLE,
+        "version": config.API_VERSION,
+        "description": config.API_DESCRIPTION,
         "sectors": list(STOCK_POOLS.keys()),
         "total_stocks": sum(len(pool["symbols"]) for pool in STOCK_POOLS.values()),
         "endpoints": {
             "all_sectors": "/api/stock-pool",
             "specific_sector": "/api/stock-pool?sector=科技股",
             "top_25": "/api/top-25",
-            "analyze_symbol": "/api/analyze?symbol=AAPL"
+            "analyze_symbol": "/api/analyze?symbol=AAPL",
+            "health": "/health"
         }
     }
 
-@app.get("/api/stock-pool")
+@app.get("/api/stock-pool", response_model=List[SectorAnalysis])
 async def get_stock_pool(
-    sector: Optional[str] = Query(None, description="產業分類（科技股/金融股/民生消費股）"),
-    limit: int = Query(10, description="每個產業返回的股票數量")
+    sector: Optional[str] = Query(None, description="產業分類"),
+    limit: int = Query(10, ge=1, le=50, description="每個產業返回的股票數量")
 ):
-    """
-    獲取股票池分析
-    - 不指定 sector：返回所有產業
-    - 指定 sector：返回特定產業
-    """
-    
-    sectors_to_analyze = [sector] if sector and sector in STOCK_POOLS else list(STOCK_POOLS.keys())
+    """獲取股票池分析"""
+    sectors_to_analyze = (
+        [sector] if sector and sector in STOCK_POOLS 
+        else list(STOCK_POOLS.keys())
+    )
     
     results = []
     
@@ -523,24 +599,33 @@ async def get_stock_pool(
         pool = STOCK_POOLS[sector_name]
         symbols = pool["symbols"]
         
-        logger.info(f"📊 開始分析 {sector_name}: {len(symbols)} 支股票")
+        logger.info(f"📊 分析 {sector_name}: {len(symbols)} 支股票")
         
-        sector_results = []
-        for symbol in symbols:
-            picker = BuffettStockPicker(symbol, sector_name)
-            analysis = await picker.analyze()
-            if analysis:
-                sector_results.append(analysis)
+        # 並行分析
+        tasks = [
+            BuffettStockPicker(symbol, sector_name).analyze() 
+            for symbol in symbols
+        ]
+        sector_results = [r for r in await asyncio.gather(*tasks) if r]
         
         # 排序並取前 N 名
         sector_results.sort(key=lambda x: x['buffettScore'], reverse=True)
         top_stocks = sector_results[:limit]
         
-        # 產業統計
-        avg_score = sum(s['buffettScore'] for s in sector_results) / len(sector_results) if sector_results else 0
-        avg_risk = sum(s['totalRisk'] for s in sector_results) / len(sector_results) if sector_results else 0
+        # 統計
+        avg_score = (
+            sum(s['buffettScore'] for s in sector_results) / len(sector_results) 
+            if sector_results else 0
+        )
+        avg_risk = (
+            sum(s['totalRisk'] for s in sector_results) / len(sector_results) 
+            if sector_results else 0
+        )
         
-        sector_risk = "低風險" if avg_risk < 35 else "中風險" if avg_risk < 55 else "高風險"
+        sector_risk = (
+            "低風險" if avg_risk < 35 else 
+            "中風險" if avg_risk < 55 else "高風險"
+        )
         
         results.append({
             "sector": sector_name,
@@ -555,51 +640,28 @@ async def get_stock_pool(
     
     return results
 
-import asyncio # 確保有 import
-
 @app.get("/api/top-25")
 async def get_top_25():
-    """
-    巴菲特的 25 支股票池
-    從三大產業中選出評分最高的 25 支股票
-    """
+    """巴菲特 TOP 25 股票池"""
+    logger.info("🎯 篩選 TOP 25 股票池...")
     
-    logger.info("🎯 開始篩選巴菲特 TOP 25 股票池...")
-    
-    # ==================== 修改後的並行分析邏輯 ====================
+    # 並行分析所有股票
     tasks = []
-    
-    # 1. 建立所有股票的分析任務，但不立即執行
     for sector_name, pool in STOCK_POOLS.items():
-        logger.info(f"📅 已排程分析產業: {sector_name}")
         for symbol in pool["symbols"]:
             picker = BuffettStockPicker(symbol, sector_name)
-            # 將協程物件加入清單
             tasks.append(picker.analyze())
     
-    # 2. 同時啟動所有任務 (並行執行)
-    logger.info(f"🚀 啟動並行分析，共 {len(tasks)} 隻股票...")
-    
-    # asyncio.gather 會同時發送請求，等待所有股票分析完畢
+    logger.info(f"🚀 並行分析 {len(tasks)} 支股票...")
     results = await asyncio.gather(*tasks)
     
-    # 3. 過濾掉分析失敗 (None) 的結果並存入 all_stocks
-    all_stocks = [r for r in results if r is not None]
-    
-    logger.info(f"✅ 分析完成，成功獲取 {len(all_stocks)} 隻股票數據")
-    # ============================================================
-    
-    # 1. 按評分排序 (確保 buffettScore 存在，若無則預設為 0)
-    # 使用 .get() 可以防止某隻股票資料殘缺導致程式崩潰
+    # 過濾並排序
+    all_stocks = [r for r in results if r]
     all_stocks.sort(key=lambda x: x.get('buffettScore', 0), reverse=True)
     
-    # 2. 取前 25 名 (如果總數不足 25，這行程式碼也會自動處理，不會報錯)
     top_25 = all_stocks[:25]
     
-    # 3. 檢查是否有資料 (預防性檢查)
     if not top_25:
-        logger.warning("⚠️ 警告：沒有任何股票分析成功！")
-        # 可以回傳一個空的成功回應，避免前端顯示 Error
         return {
             "status": "success",
             "top_25_stocks": [],
@@ -611,125 +673,124 @@ async def get_top_25():
             }
         }
     
-    # 1. 取得實際取得的股票數量
-    actual_count = len(top_25)
-    
-    # 2. 初始化統計變數
+    # 統計計算
     sectors_count = {}
     total_score = 0
     total_risk = 0
     high_grade_count = 0
     
-    # 3. 進行統計迴圈
     for stock in top_25:
-        # 產業分布統計
         sector = stock.get('sector', '未知')
         sectors_count[sector] = sectors_count.get(sector, 0) + 1
-        
-        # 累加分數與風險 (使用 get 預防 Key 缺失)
         total_score += stock.get('buffettScore', 0)
         total_risk += stock.get('totalRisk', 0)
         
-        # 判斷等級 (加入安全導航)
         criteria = stock.get('buffettCriteria', {})
         if criteria.get('grade') in ['A+', 'A']:
             high_grade_count += 1
-            
-    # 4. 計算平均值 (使用實際數量作為除數，避免除以零)
-    divisor = actual_count if actual_count > 0 else 1
+    
+    count = len(top_25)
     
     return {
-        "status": "success",  # 讓前端更容易判斷請求成功
+        "status": "success",
         "title": "巴菲特 TOP 25 股票池",
         "description": "基於價值投資原則篩選的優質股票",
         "total_analyzed": len(all_stocks),
         "top_25_stocks": top_25,
         "statistics": {
-            "average_score": round(total_score / divisor, 1),
-            "average_risk": round(total_risk / divisor, 1),
+            "average_score": round(total_score / count, 1),
+            "average_risk": round(total_risk / count, 1),
             "high_grade_stocks": high_grade_count,
             "sector_distribution": sectors_count,
-            "count": actual_count  # 回傳實際數量給前端參考
+            "count": count
         },
-        "criteria": getattr(BuffettStockPicker, 'BUFFETT_CRITERIA', {}),
+        "criteria": BuffettStockPicker.BUFFETT_CRITERIA,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/analyze")
 async def analyze_single_stock(
-    symbol: str = Query(..., description="股票代號，例如: AAPL"),
+    symbol: str = Query(..., description="股票代號"),
     sector: str = Query("科技股", description="產業分類")
 ):
-    """
-    單一股票即時分析
-    """
+    """單一股票分析"""
     symbol = symbol.upper().strip()
-    logger.info(f"🔍 正在進行單一股票深度分析: {symbol} (產業: {sector})")
+    
+    if sector not in STOCK_POOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"無效的產業分類。可用選項: {list(STOCK_POOLS.keys())}"
+        )
+    
+    logger.info(f"🔍 分析: {symbol} ({sector})")
     
     try:
-        # 1. 初始化分析器
         picker = BuffettStockPicker(symbol, sector)
-        
-        # 2. 執行分析
-        # 注意：如果你的分析器內部沒有處理異常，這裡可以用 try-except 包起來
         result = await picker.analyze()
         
-        # 3. 檢查結果
         if not result:
-            logger.warning(f"⚠️ {symbol} 分析結果為空，可能是代號錯誤或數據源(Yahoo Finance)無資料")
             raise HTTPException(
-                status_code=404, 
-                detail=f"無法獲取 {symbol} 的分析數據。請確認代號是否正確，或該公司是否缺少近期的財務報表。"
+                status_code=404,
+                detail=f"無法獲取 {symbol} 的數據。請確認代號是否正確。"
             )
         
-        # 4. 回傳結果並加入成功狀態
         return {
             "status": "success",
             "data": result,
             "timestamp": datetime.now().isoformat()
         }
-
-    except HTTPException as http_e:
-        raise http_e
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ 分析 {symbol} 時發生非預期錯誤: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"伺服器分析錯誤: {str(e)}"
-        )
-
-import time # 記得在文件上方 import time
-
-# 在檔案頂部定義啟動時間
-START_TIME = time.time()
+        logger.error(f"❌ 分析 {symbol} 失敗: {e}")
+        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    """
-    系統健康檢查
-    提供運行狀態、數據規模及伺服器效能資訊
-    """
-    # 計算運行秒數
+    """健康檢查"""
     uptime_seconds = int(time.time() - START_TIME)
+    hours = uptime_seconds // 3600
+    minutes = (uptime_seconds % 3600) // 60
     
     return {
         "status": "healthy",
+        "version": config.API_VERSION,
         "timestamp": datetime.now().isoformat(),
-        "uptime": f"{uptime_seconds} seconds",
+        "uptime": f"{hours}h {minutes}m",
+        "uptime_seconds": uptime_seconds,
         "data_info": {
             "sectors_count": len(STOCK_POOLS),
-            "total_stocks_in_pool": sum(len(pool["symbols"]) for pool in STOCK_POOLS.values()),
-            "monitored_sectors": list(STOCK_POOLS.keys())
+            "total_stocks": sum(len(p["symbols"]) for p in STOCK_POOLS.values()),
+            "sectors": list(STOCK_POOLS.keys())
         },
         "configuration": {
-            "cache_expire_seconds": CACHE_EXPIRE_SECONDS,
-            "timezone": "UTC"
+            "cache_expire_seconds": config.CACHE_EXPIRE_SECONDS,
+            "max_concurrent_requests": config.MAX_CONCURRENT_REQUESTS,
+            "max_requests_per_minute": config.MAX_REQUESTS_PER_MINUTE
         },
-        "server_environment": "Render.com" if "RENDER" in os.environ else "local"
+        "environment": "Render" if "RENDER" in os.environ else "Local"
     }
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """全域例外處理器"""
+    logger.error(f"未處理的例外: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "message": "伺服器內部錯誤",
+            "detail": str(exc) if os.environ.get("DEBUG") else "請稍後再試"
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    # 優先讀取 Render 提供的 PORT，若無則預設 10000
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
