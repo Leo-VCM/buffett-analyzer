@@ -1,15 +1,17 @@
 """
-Buffett Stock Picker - 巴菲特選股系統 (優化版)
-按產業分類,篩選出符合巴菲特標準的 25 支股票池
+Buffett Stock Picker - 巴菲特選股系統 (每日快取版)
+每天自動計算一次,使用者直接讀取結果,無需等待
 """
 import os
 import logging
 import random
 import asyncio
 from typing import List, Optional, Dict, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from functools import lru_cache
 from contextlib import asynccontextmanager
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -29,21 +31,28 @@ class Config:
     CACHE_PATH = "/tmp/yfinance_stock_cache"
     CACHE_EXPIRE_SECONDS = int(os.environ.get("CACHE_EXPIRE", 3600))
     
+    # 每日分析結果儲存路徑
+    DAILY_CACHE_PATH = "/tmp/daily_analysis_cache.json"
+    
     # 速率限制
-    MAX_REQUESTS_PER_MINUTE = 20  # 提高到 20
-    MIN_REQUEST_DELAY = 0.2  # 降低延遲
+    MAX_REQUESTS_PER_MINUTE = 20
+    MIN_REQUEST_DELAY = 0.2
     
     # 資料要求
     MIN_HISTORY_DAYS = 20
     MIN_INFO_FIELDS = 5
     
     # 並行控制
-    MAX_CONCURRENT_REQUESTS = 10  # 限制同時並行數
+    MAX_CONCURRENT_REQUESTS = 10
+    
+    # 每日更新時間 (UTC 時間,午夜 00:00)
+    DAILY_UPDATE_HOUR = 0
+    DAILY_UPDATE_MINUTE = 0
     
     # API 設定
     API_TITLE = "Buffett Stock Picker API"
-    API_VERSION = "3.1"
-    API_DESCRIPTION = "巴菲特選股系統 - 三大產業股票池分析 (優化版)"
+    API_VERSION = "4.0"
+    API_DESCRIPTION = "巴菲特選股系統 - 每日自動更新版"
 
 config = Config()
 
@@ -55,6 +64,75 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== 每日快取管理器 ====================
+
+class DailyCacheManager:
+    """管理每日分析結果的快取"""
+    
+    def __init__(self, cache_path: str):
+        self.cache_path = cache_path
+        self.cache_data = None
+        self.last_update = None
+        
+    def load_cache(self) -> Optional[dict]:
+        """載入快取資料"""
+        try:
+            if os.path.exists(self.cache_path):
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.cache_data = data
+                    self.last_update = datetime.fromisoformat(data.get('last_update', ''))
+                    logger.info(f"✅ 載入快取成功,上次更新: {self.last_update}")
+                    return data
+        except Exception as e:
+            logger.error(f"❌ 載入快取失敗: {e}")
+        return None
+    
+    def save_cache(self, data: dict):
+        """儲存快取資料"""
+        try:
+            cache_data = {
+                'last_update': datetime.now().isoformat(),
+                'data': data
+            }
+            
+            # 確保目錄存在
+            os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+            
+            with open(self.cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            
+            self.cache_data = cache_data
+            self.last_update = datetime.now()
+            logger.info(f"✅ 快取已儲存: {self.cache_path}")
+            
+        except Exception as e:
+            logger.error(f"❌ 儲存快取失敗: {e}")
+    
+    def is_cache_valid(self) -> bool:
+        """檢查快取是否仍然有效 (當日有效)"""
+        if not self.last_update:
+            return False
+        
+        now = datetime.now()
+        # 如果是同一天的快取,視為有效
+        return (
+            self.last_update.date() == now.date() and
+            self.cache_data is not None
+        )
+    
+    def get_cached_data(self) -> Optional[dict]:
+        """獲取快取資料"""
+        if self.is_cache_valid():
+            logger.info("✅ 使用快取資料")
+            return self.cache_data.get('data')
+        
+        logger.info("⚠️ 快取已過期或不存在")
+        return None
+
+# 初始化快取管理器
+cache_manager = DailyCacheManager(config.DAILY_CACHE_PATH)
+
 # ==================== 快取與啟動管理 ====================
 
 session = requests_cache.CachedSession(
@@ -65,12 +143,75 @@ session = requests_cache.CachedSession(
 
 START_TIME = time.time()
 
+# 全域變數儲存背景任務
+background_task = None
+
+async def daily_update_task():
+    """每日定時更新任務"""
+    while True:
+        try:
+            now = datetime.now()
+            
+            # 計算下次更新時間 (今天或明天的指定時間)
+            next_update = datetime.combine(
+                now.date(),
+                dt_time(config.DAILY_UPDATE_HOUR, config.DAILY_UPDATE_MINUTE)
+            )
+            
+            # 如果今天的更新時間已過,改為明天
+            if now >= next_update:
+                next_update += timedelta(days=1)
+            
+            wait_seconds = (next_update - now).total_seconds()
+            logger.info(f"⏰ 下次更新時間: {next_update.strftime('%Y-%m-%d %H:%M:%S')} (等待 {wait_seconds/3600:.1f} 小時)")
+            
+            # 等待到下次更新時間
+            await asyncio.sleep(wait_seconds)
+            
+            # 執行分析
+            logger.info("🚀 開始每日自動分析...")
+            result = await perform_full_analysis()
+            
+            if result:
+                cache_manager.save_cache(result)
+                logger.info("✅ 每日分析完成並已快取")
+            else:
+                logger.error("❌ 每日分析失敗")
+                
+        except Exception as e:
+            logger.error(f"❌ 每日更新任務錯誤: {e}")
+            # 發生錯誤時等待 1 小時後重試
+            await asyncio.sleep(3600)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """應用生命週期管理"""
+    global background_task
+    
     logger.info("🚀 巴菲特選股系統啟動中...")
-    logger.info(f"📊 快取過期時間: {config.CACHE_EXPIRE_SECONDS}秒")
+    
+    # 載入現有快取
+    cache_manager.load_cache()
+    
+    # 如果快取無效,立即執行一次分析
+    if not cache_manager.is_cache_valid():
+        logger.info("⚠️ 快取無效,執行初始分析...")
+        try:
+            result = await perform_full_analysis()
+            if result:
+                cache_manager.save_cache(result)
+        except Exception as e:
+            logger.error(f"❌ 初始分析失敗: {e}")
+    
+    # 啟動背景更新任務
+    background_task = asyncio.create_task(daily_update_task())
+    logger.info("✅ 每日更新任務已啟動")
+    
     yield
+    
+    # 關閉時取消背景任務
+    if background_task:
+        background_task.cancel()
     logger.info("👋 系統正在關閉...")
 
 # ==================== FastAPI 初始化 ====================
@@ -128,14 +269,13 @@ STOCK_POOLS = {
 # ==================== 優化的速率限制器 ====================
 
 class RateLimiter:
-    """改進的速率限制器,支援並行控制"""
+    """改進的速率限制器"""
     
     def __init__(self):
         self.requests = []
         self.semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
         
     def _clean_old_requests(self):
-        """清理過期的請求記錄"""
         now = datetime.now()
         self.requests = [
             req for req in self.requests 
@@ -143,29 +283,24 @@ class RateLimiter:
         ]
     
     def can_make_request(self) -> bool:
-        """檢查是否可以發送請求"""
         self._clean_old_requests()
         return len(self.requests) < config.MAX_REQUESTS_PER_MINUTE
     
     def record_request(self):
-        """記錄請求時間"""
         self.requests.append(datetime.now())
     
     async def wait_if_needed(self):
-        """智能等待機制"""
         wait_count = 0
         while not self.can_make_request():
             wait_count += 1
             if wait_count == 1:
                 logger.warning("⚠️ 達到速率限制,等待中...")
-            await asyncio.sleep(3)  # 縮短等待時間
-        
-        # 添加隨機延遲避免突發請求
+            await asyncio.sleep(3)
         await asyncio.sleep(random.uniform(0.1, config.MIN_REQUEST_DELAY))
 
 rate_limiter = RateLimiter()
 
-# ==================== 數據模型 (增強驗證) ====================
+# ==================== 數據模型 ====================
 
 class StockAnalysis(BaseModel):
     symbol: str
@@ -183,25 +318,6 @@ class StockAnalysis(BaseModel):
     risks: Dict[str, float]
     buffettCriteria: Dict
     details: Dict
-    
-    @validator('pe')
-    def validate_pe(cls, v):
-        """驗證 P/E 值"""
-        if isinstance(v, str):
-            return v
-        if v < 0:
-            return "N/A"
-        return v
-
-class SectorAnalysis(BaseModel):
-    sector: str
-    description: str
-    total_stocks: int
-    analyzed_stocks: int
-    top_picks: List[StockAnalysis]
-    average_score: float
-    average_risk: float
-    sector_risk: str
 
 # ==================== 資料獲取優化 ====================
 
@@ -210,24 +326,20 @@ class DataFetcher:
     
     @staticmethod
     async def fetch_stock_data(symbol: str) -> Tuple[Optional[dict], Optional[pd.DataFrame]]:
-        """非同步獲取股票資料,帶重試機制"""
         max_retries = 2
         
         for attempt in range(max_retries):
             try:
                 stock = yf.Ticker(symbol, session=session)
                 
-                # 使用 fast_info 作為備選方案
                 try:
                     info = stock.info
                 except Exception:
                     logger.warning(f"⚠️ {symbol}: info 失敗,嘗試 fast_info")
                     info = stock.fast_info.__dict__ if hasattr(stock, 'fast_info') else {}
                 
-                # 獲取歷史數據
                 hist = stock.history(period="1y", auto_adjust=True)
                 
-                # 驗證數據完整性
                 if not info or len(info) < config.MIN_INFO_FIELDS:
                     logger.warning(f"❌ {symbol}: 基本面資料不足")
                     return None, None
@@ -248,24 +360,18 @@ class DataFetcher:
     
     @staticmethod
     def normalize_financial_metrics(info: dict) -> Dict[str, float]:
-        """標準化財務指標"""
-        # ROE 處理
         raw_roe = info.get('returnOnEquity')
         roe = (raw_roe * 100 if raw_roe and abs(raw_roe) < 1 else raw_roe) if raw_roe else 0
         
-        # P/E 處理
         pe = info.get('forwardPE') or info.get('trailingPE')
         pe = min(pe, 500) if pe and pe > 0 else 999
         
-        # 淨利率
         margin = info.get('profitMargins')
         profit_margin = (margin * 100) if margin else 0
         
-        # 債務權益比
         raw_d_e = info.get('debtToEquity')
         debt_to_equity = (raw_d_e if raw_d_e < 5 else raw_d_e / 100) if raw_d_e else 2.0
         
-        # 營收成長
         rev_growth = (info.get('revenueGrowth', 0) or 0) * 100
         
         return {
@@ -276,7 +382,7 @@ class DataFetcher:
             'revenue_growth': rev_growth
         }
 
-# ==================== 巴菲特選股引擎 (優化版) ====================
+# ==================== 巴菲特選股引擎 ====================
 
 class BuffettStockPicker:
     """優化的巴菲特選股引擎"""
@@ -300,24 +406,19 @@ class BuffettStockPicker:
         self.data_fetcher = DataFetcher()
     
     def _calculate_momentum(self, hist: pd.DataFrame, current_price: float) -> Dict[str, float]:
-        """計算多時間框架動能"""
         try:
             momentum = {}
             
-            # 確保有足夠的資料
             if len(hist) < 21:
                 return {'1y': 0, '6m': 0, '1m': 0}
             
-            # 一年動能
             one_year_ago = hist['Close'].iloc[0]
             momentum['1y'] = ((current_price - one_year_ago) / one_year_ago) * 100
             
-            # 六個月動能
             half_year_idx = max(0, len(hist) // 2)
             six_months_ago = hist['Close'].iloc[half_year_idx]
             momentum['6m'] = ((current_price - six_months_ago) / six_months_ago) * 100
             
-            # 一個月動能
             one_month_idx = max(0, len(hist) - 21)
             one_month_ago = hist['Close'].iloc[one_month_idx]
             momentum['1m'] = ((current_price - one_month_ago) / one_month_ago) * 100
@@ -329,43 +430,30 @@ class BuffettStockPicker:
             return {'1y': 0, '6m': 0, '1m': 0}
     
     def _calculate_technical_indicators(self, hist: pd.DataFrame) -> Dict[str, float]:
-        """計算技術指標"""
         ma200 = hist['Close'].rolling(window=200, min_periods=1).mean().iloc[-1]
         ma50 = hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1]
         
-        return {
-            'ma200': ma200,
-            'ma50': ma50
-        }
+        return {'ma200': ma200, 'ma50': ma50}
     
     def _assess_market_phase(self, current_price: float, ma200: float, ma50: float) -> str:
-        """評估市場階段"""
         if current_price > ma200:
             return "多頭排列" if current_price > ma50 else "高檔震盪"
         else:
             return "空頭趨勢" if current_price < ma50 else "低檔打底"
     
     def _calculate_factor_scores(self, metrics: dict, momentum: dict) -> Dict[str, int]:
-        """計算四大因子評分"""
         pe = metrics['pe']
         roe = metrics['roe']
         rev_growth = metrics['revenue_growth']
         
-        # Value Score
         v_score = 0 if pe >= 999 else (
             100 if pe < 12 else 80 if pe < 20 else 50 if pe < 30 else 20
         )
         
-        # Quality Score
         q_score = min(100, max(0, roe * 4))
-        
-        # Momentum Score
         m_score = max(0, min(100, (momentum['1y'] * 0.4 + momentum['6m'] * 0.6) + 50))
-        
-        # Growth Score
         g_score = min(100, max(0, rev_growth * 2 + 50)) if rev_growth != 0 else 60
         
-        # 應用產業權重
         weight = self.SECTOR_WEIGHTS.get(self.sector, {})
         v_score = min(100, v_score * weight.get("value", 1.0))
         q_score = min(100, q_score * weight.get("quality", 1.0))
@@ -386,8 +474,6 @@ class BuffettStockPicker:
         is_positive_momentum: bool,
         market_phase: str
     ) -> float:
-        """計算最終巴菲特評分"""
-        # 基礎評分
         base_score = (
             factor_scores['value'] * 0.35 +
             factor_scores['quality'] * 0.35 +
@@ -395,13 +481,11 @@ class BuffettStockPicker:
             factor_scores['growth'] * 0.15
         )
         
-        # 標準加成
         if criteria_passed >= 4:
             base_score *= 1.15
         elif criteria_passed >= 3:
             base_score *= 1.05
         
-        # 趨勢調整
         final_score = base_score
         if not is_positive_momentum:
             final_score *= 0.75
@@ -415,19 +499,14 @@ class BuffettStockPicker:
         metrics: dict, 
         hist: pd.DataFrame
     ) -> Tuple[float, Dict[str, float]]:
-        """計算風險評分"""
-        # 債務風險
         debt_r = min(100, metrics['debt_to_equity'] * 50)
         
-        # 估值風險
         pe = metrics['pe']
         val_r = 100 if pe >= 100 else (pe / 40) * 100
         
-        # 波動風險
         returns = hist['Close'].pct_change().dropna()
         vol_r = (returns.std() * np.sqrt(252) * 100) if len(returns) > 20 else 50
         
-        # 綜合風險
         total_risk = min(100, debt_r * 0.4 + val_r * 0.4 + vol_r * 0.2)
         
         return total_risk, {
@@ -437,11 +516,8 @@ class BuffettStockPicker:
         }
     
     async def analyze(self) -> Optional[dict]:
-        """執行完整分析"""
         try:
-            # 控制並行數量
             async with rate_limiter.semaphore:
-                # 檢查快取
                 is_cached = session.cache.has_url(
                     f"https://query2.finance.yahoo.com/v8/finance/chart/{self.symbol}"
                 )
@@ -450,13 +526,11 @@ class BuffettStockPicker:
                     await rate_limiter.wait_if_needed()
                     rate_limiter.record_request()
                 
-                # 獲取資料
                 info, hist = await self.data_fetcher.fetch_stock_data(self.symbol)
                 
                 if not info or hist is None:
                     return None
                 
-                # 基本資訊
                 company_name = info.get('longName') or info.get('shortName') or self.symbol
                 current_price = (
                     info.get('currentPrice') or
@@ -467,23 +541,15 @@ class BuffettStockPicker:
                 if not current_price or current_price <= 0:
                     return None
                 
-                # 標準化財務指標
                 metrics = self.data_fetcher.normalize_financial_metrics(info)
-                
-                # 計算動能
                 momentum = self._calculate_momentum(hist, current_price)
-                
-                # 技術指標
                 tech_indicators = self._calculate_technical_indicators(hist)
-                
-                # 市場階段
                 market_phase = self._assess_market_phase(
                     current_price, 
                     tech_indicators['ma200'], 
                     tech_indicators['ma50']
                 )
                 
-                # 巴菲特標準檢查
                 is_positive_momentum = momentum['6m'] > 0 and momentum['1m'] > -5
                 
                 buffett_criteria = {
@@ -501,10 +567,7 @@ class BuffettStockPicker:
                     "B" if criteria_passed == 3 else "C"
                 )
                 
-                # 計算因子評分
                 factor_scores = self._calculate_factor_scores(metrics, momentum)
-                
-                # 計算最終評分
                 final_score = self._calculate_buffett_score(
                     factor_scores,
                     criteria_passed,
@@ -512,10 +575,8 @@ class BuffettStockPicker:
                     market_phase
                 )
                 
-                # 風險評估
                 total_risk, risk_breakdown = self._calculate_risk_score(metrics, hist)
                 
-                # 投資建議
                 recommendation = (
                     "強力推薦 ⭐⭐⭐" if final_score > 85 and criteria_passed >= 4 else
                     "優質標的 ⭐⭐" if final_score > 70 and criteria_passed >= 3 else
@@ -562,6 +623,103 @@ class BuffettStockPicker:
             logger.error(f"❌ {self.symbol} 分析失敗: {e}")
             return None
 
+# ==================== 核心分析函數 ====================
+
+async def perform_full_analysis() -> Optional[dict]:
+    """執行完整的股票分析 (TOP 25 + 產業分類)"""
+    try:
+        logger.info("🚀 開始完整分析...")
+        
+        # 並行分析所有股票
+        tasks = []
+        for sector_name, pool in STOCK_POOLS.items():
+            for symbol in pool["symbols"]:
+                picker = BuffettStockPicker(symbol, sector_name)
+                tasks.append(picker.analyze())
+        
+        logger.info(f"📊 並行分析 {len(tasks)} 支股票...")
+        results = await asyncio.gather(*tasks)
+        
+        all_stocks = [r for r in results if r]
+        logger.info(f"✅ 成功分析 {len(all_stocks)} 支股票")
+        
+        # 排序取 TOP 25
+        all_stocks.sort(key=lambda x: x.get('buffettScore', 0), reverse=True)
+        top_25 = all_stocks[:25]
+        
+        # 計算統計數據
+        sectors_count = {}
+        total_score = 0
+        total_risk = 0
+        high_grade_count = 0
+        
+        for stock in top_25:
+            sector = stock.get('sector', '未知')
+            sectors_count[sector] = sectors_count.get(sector, 0) + 1
+            total_score += stock.get('buffettScore', 0)
+            total_risk += stock.get('totalRisk', 0)
+            
+            criteria = stock.get('buffettCriteria', {})
+            if criteria.get('grade') in ['A+', 'A']:
+                high_grade_count += 1
+        
+        count = len(top_25)
+        
+        # 產業分類數據
+        sector_analysis = []
+        for sector_name, pool in STOCK_POOLS.items():
+            sector_stocks = [s for s in all_stocks if s['sector'] == sector_name]
+            sector_stocks.sort(key=lambda x: x['buffettScore'], reverse=True)
+            
+            avg_score = (
+                sum(s['buffettScore'] for s in sector_stocks) / len(sector_stocks)
+                if sector_stocks else 0
+            )
+            avg_risk = (
+                sum(s['totalRisk'] for s in sector_stocks) / len(sector_stocks)
+                if sector_stocks else 0
+            )
+            
+            sector_risk = (
+                "低風險" if avg_risk < 35 else 
+                "中風險" if avg_risk < 55 else "高風險"
+            )
+            
+            sector_analysis.append({
+                "sector": sector_name,
+                "description": pool["description"],
+                "total_stocks": len(pool["symbols"]),
+                "analyzed_stocks": len(sector_stocks),
+                "top_picks": sector_stocks[:10],
+                "average_score": round(avg_score, 1),
+                "average_risk": round(avg_risk, 1),
+                "sector_risk": sector_risk
+            })
+        
+        return {
+            "top_25": {
+                "status": "success",
+                "title": "巴菲特 TOP 25 股票池",
+                "description": "基於價值投資原則篩選的優質股票",
+                "total_analyzed": len(all_stocks),
+                "rankings": top_25,
+                "statistics": {
+                    "average_score": round(total_score / count, 1) if count > 0 else 0,
+                    "average_risk": round(total_risk / count, 1) if count > 0 else 0,
+                    "high_grade_stocks": high_grade_count,
+                    "sector_distribution": sectors_count,
+                    "count": count
+                },
+                "criteria": BuffettStockPicker.BUFFETT_CRITERIA,
+                "last_update": datetime.now().isoformat()
+            },
+            "sectors": sector_analysis
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 完整分析失敗: {e}")
+        return None
+
 # ==================== API 端點 ====================
 
 @app.get("/")
@@ -571,180 +729,100 @@ async def root():
         "service": config.API_TITLE,
         "version": config.API_VERSION,
         "description": config.API_DESCRIPTION,
+        "cache_status": {
+            "is_valid": cache_manager.is_cache_valid(),
+            "last_update": cache_manager.last_update.isoformat() if cache_manager.last_update else None
+        },
         "sectors": list(STOCK_POOLS.keys()),
         "total_stocks": sum(len(pool["symbols"]) for pool in STOCK_POOLS.values()),
         "endpoints": {
-            "all_sectors": "/api/stock-pool",
-            "specific_sector": "/api/stock-pool?sector=科技股",
-            "top_25": "/api/top-25",
-            "analyze_symbol": "/api/analyze?symbol=AAPL",
+            "sp500_analysis": "/sp500-analysis (主要端點 - 返回 TOP 25)",
+            "stock_pool": "/api/stock-pool (產業分類)",
+            "force_refresh": "/api/refresh (強制重新分析)",
             "health": "/health"
         }
     }
 
-@app.get("/api/stock-pool", response_model=List[SectorAnalysis])
+@app.get("/sp500-analysis")
+async def get_sp500_analysis():
+    """
+    獲取 TOP 25 分析結果 (使用每日快取)
+    前端主要調用此端點
+    """
+    # 嘗試從快取獲取
+    cached_data = cache_manager.get_cached_data()
+    
+    if cached_data and 'top_25' in cached_data:
+        logger.info("✅ 返回快取的 TOP 25 數據")
+        return cached_data['top_25']
+    
+    # 快取無效,返回錯誤訊息
+    logger.warning("⚠️ 快取無效,需要等待每日更新")
+    raise HTTPException(
+        status_code=503,
+        detail="分析數據正在更新中,請稍後再試 (每日自動更新時間: UTC 00:00)"
+    )
+
+@app.get("/api/stock-pool")
 async def get_stock_pool(
     sector: Optional[str] = Query(None, description="產業分類"),
     limit: int = Query(10, ge=1, le=50, description="每個產業返回的股票數量")
 ):
-    """獲取股票池分析"""
-    sectors_to_analyze = (
-        [sector] if sector and sector in STOCK_POOLS 
-        else list(STOCK_POOLS.keys())
-    )
+    """
+    獲取產業分類數據 (使用每日快取)
+    """
+    cached_data = cache_manager.get_cached_data()
     
+    if not cached_data or 'sectors' not in cached_data:
+        raise HTTPException(
+            status_code=503,
+            detail="分析數據正在更新中,請稍後再試"
+        )
+    
+    sectors_data = cached_data['sectors']
+    
+    # 如果指定產業,只返回該產業
+    if sector:
+        sector_result = [s for s in sectors_data if s['sector'] == sector]
+        if not sector_result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"找不到產業: {sector}"
+            )
+        # 調整返回的股票數量
+        result = sector_result[0].copy()
+        result['top_picks'] = result['top_picks'][:limit]
+        return [result]
+    
+    # 返回所有產業,調整每個產業的股票數量
     results = []
-    
-    for sector_name in sectors_to_analyze:
-        pool = STOCK_POOLS[sector_name]
-        symbols = pool["symbols"]
-        
-        logger.info(f"📊 分析 {sector_name}: {len(symbols)} 支股票")
-        
-        # 並行分析
-        tasks = [
-            BuffettStockPicker(symbol, sector_name).analyze() 
-            for symbol in symbols
-        ]
-        sector_results = [r for r in await asyncio.gather(*tasks) if r]
-        
-        # 排序並取前 N 名
-        sector_results.sort(key=lambda x: x['buffettScore'], reverse=True)
-        top_stocks = sector_results[:limit]
-        
-        # 統計
-        avg_score = (
-            sum(s['buffettScore'] for s in sector_results) / len(sector_results) 
-            if sector_results else 0
-        )
-        avg_risk = (
-            sum(s['totalRisk'] for s in sector_results) / len(sector_results) 
-            if sector_results else 0
-        )
-        
-        sector_risk = (
-            "低風險" if avg_risk < 35 else 
-            "中風險" if avg_risk < 55 else "高風險"
-        )
-        
-        results.append({
-            "sector": sector_name,
-            "description": pool["description"],
-            "total_stocks": len(symbols),
-            "analyzed_stocks": len(sector_results),
-            "top_picks": top_stocks,
-            "average_score": round(avg_score, 1),
-            "average_risk": round(avg_risk, 1),
-            "sector_risk": sector_risk
-        })
+    for s in sectors_data:
+        s_copy = s.copy()
+        s_copy['top_picks'] = s['top_picks'][:limit]
+        results.append(s_copy)
     
     return results
 
-@app.get("/api/top-25")
-async def get_top_25():
-    """巴菲特 TOP 25 股票池"""
-    logger.info("🎯 篩選 TOP 25 股票池...")
+@app.post("/api/refresh")
+async def force_refresh(background_tasks: BackgroundTasks):
+    """
+    強制重新分析 (管理員功能)
+    分析將在背景執行
+    """
+    async def refresh_task():
+        logger.info("🔄 強制重新分析...")
+        result = await perform_full_analysis()
+        if result:
+            cache_manager.save_cache(result)
+            logger.info("✅ 強制分析完成")
     
-    # 並行分析所有股票
-    tasks = []
-    for sector_name, pool in STOCK_POOLS.items():
-        for symbol in pool["symbols"]:
-            picker = BuffettStockPicker(symbol, sector_name)
-            tasks.append(picker.analyze())
-    
-    logger.info(f"🚀 並行分析 {len(tasks)} 支股票...")
-    results = await asyncio.gather(*tasks)
-    
-    # 過濾並排序
-    all_stocks = [r for r in results if r]
-    all_stocks.sort(key=lambda x: x.get('buffettScore', 0), reverse=True)
-    
-    top_25 = all_stocks[:25]
-    
-    if not top_25:
-        return {
-            "status": "success",
-            "top_25_stocks": [],
-            "statistics": {
-                "average_score": 0,
-                "average_risk": 0,
-                "high_grade_stocks": 0,
-                "sector_distribution": {}
-            }
-        }
-    
-    # 統計計算
-    sectors_count = {}
-    total_score = 0
-    total_risk = 0
-    high_grade_count = 0
-    
-    for stock in top_25:
-        sector = stock.get('sector', '未知')
-        sectors_count[sector] = sectors_count.get(sector, 0) + 1
-        total_score += stock.get('buffettScore', 0)
-        total_risk += stock.get('totalRisk', 0)
-        
-        criteria = stock.get('buffettCriteria', {})
-        if criteria.get('grade') in ['A+', 'A']:
-            high_grade_count += 1
-    
-    count = len(top_25)
+    background_tasks.add_task(refresh_task)
     
     return {
-        "status": "success",
-        "title": "巴菲特 TOP 25 股票池",
-        "description": "基於價值投資原則篩選的優質股票",
-        "total_analyzed": len(all_stocks),
-        "top_25_stocks": top_25,
-        "statistics": {
-            "average_score": round(total_score / count, 1),
-            "average_risk": round(total_risk / count, 1),
-            "high_grade_stocks": high_grade_count,
-            "sector_distribution": sectors_count,
-            "count": count
-        },
-        "criteria": BuffettStockPicker.BUFFETT_CRITERIA,
-        "timestamp": datetime.now().isoformat()
+        "status": "accepted",
+        "message": "分析任務已啟動,將在背景執行",
+        "estimated_time": "1-2 分鐘"
     }
-
-@app.get("/api/analyze")
-async def analyze_single_stock(
-    symbol: str = Query(..., description="股票代號"),
-    sector: str = Query("科技股", description="產業分類")
-):
-    """單一股票分析"""
-    symbol = symbol.upper().strip()
-    
-    if sector not in STOCK_POOLS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"無效的產業分類。可用選項: {list(STOCK_POOLS.keys())}"
-        )
-    
-    logger.info(f"🔍 分析: {symbol} ({sector})")
-    
-    try:
-        picker = BuffettStockPicker(symbol, sector)
-        result = await picker.analyze()
-        
-        if not result:
-            raise HTTPException(
-                status_code=404,
-                detail=f"無法獲取 {symbol} 的數據。請確認代號是否正確。"
-            )
-        
-        return {
-            "status": "success",
-            "data": result,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ 分析 {symbol} 失敗: {e}")
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
 
 @app.get("/health")
 async def health_check():
@@ -753,12 +831,19 @@ async def health_check():
     hours = uptime_seconds // 3600
     minutes = (uptime_seconds % 3600) // 60
     
+    cache_valid = cache_manager.is_cache_valid()
+    
     return {
         "status": "healthy",
         "version": config.API_VERSION,
         "timestamp": datetime.now().isoformat(),
         "uptime": f"{hours}h {minutes}m",
         "uptime_seconds": uptime_seconds,
+        "cache_status": {
+            "is_valid": cache_valid,
+            "last_update": cache_manager.last_update.isoformat() if cache_manager.last_update else None,
+            "next_update": "每日 UTC 00:00"
+        },
         "data_info": {
             "sectors_count": len(STOCK_POOLS),
             "total_stocks": sum(len(p["symbols"]) for p in STOCK_POOLS.values()),
@@ -767,7 +852,7 @@ async def health_check():
         "configuration": {
             "cache_expire_seconds": config.CACHE_EXPIRE_SECONDS,
             "max_concurrent_requests": config.MAX_CONCURRENT_REQUESTS,
-            "max_requests_per_minute": config.MAX_REQUESTS_PER_MINUTE
+            "daily_update_time": f"{config.DAILY_UPDATE_HOUR:02d}:{config.DAILY_UPDATE_MINUTE:02d} UTC"
         },
         "environment": "Render" if "RENDER" in os.environ else "Local"
     }
