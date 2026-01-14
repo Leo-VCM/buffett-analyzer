@@ -923,10 +923,16 @@ async def global_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    
+    # 1. 取得 Render 分配的 Port，預設為 10000
     port = int(os.environ.get("PORT", 10000))
+    
+    # 2. 啟動服務
     uvicorn.run(
-        app,
-        host="0.0.0.0",
+        "main:app",  # 建議改為 "檔案名稱:app物件名稱"，這樣在某些環境下支援度更好
+        host="0.0.0.0", 
         port=port,
-        log_level="info"
+        proxy_headers=True, # 建議加入：讓後端能正確獲取前端的真實 IP 與 HTTPS 協議
+        forwarded_allow_ips="*" # 建議加入：配合 Render 的反向代理
     )
