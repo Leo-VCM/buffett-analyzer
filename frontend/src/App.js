@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, Activity, Clock, ShieldAlert, BarChart3, Lock, Unlock, ChevronRight, Download, AlertCircle, Loader2, Award, Building2 } from 'lucide-react';
+import { TrendingUp, Activity, Clock, ShieldAlert, BarChart3, Lock, Unlock, ChevronRight, Download, AlertCircle, Loader2, Award, Building2, RefreshCw } from 'lucide-react';
 
 const API_BASE_URL = "https://buffett-analyzer.onrender.com";
 
@@ -10,15 +10,36 @@ const App = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [email, setEmail] = useState("");
   const [error, setError] = useState(null);
-  const [activeTab, setActiveTab] = useState("top25"); // top25 or sectors
+  const [activeTab, setActiveTab] = useState("top25");
   const [selectedSector, setSelectedSector] = useState("全部");
   const [statistics, setStatistics] = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(null);
 
-  const handleLogin = () => {
-    if (email.includes("@")) {
+  // 檢查本地儲存的登入狀態
+  useEffect(() => {
+    const savedEmail = localStorage.getItem('userEmail');
+    if (savedEmail) {
+      setEmail(savedEmail);
       setIsLoggedIn(true);
       fetchTop25();
     }
+  }, []);
+
+  const handleLogin = () => {
+    if (email.includes("@")) {
+      localStorage.setItem('userEmail', email);
+      setIsLoggedIn(true);
+      fetchTop25();
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('userEmail');
+    setIsLoggedIn(false);
+    setEmail("");
+    setTop25Stocks([]);
+    setSectorData([]);
+    setStatistics(null);
   };
 
   const fetchTop25 = async () => {
@@ -26,43 +47,41 @@ const App = () => {
     setError(null);
     
     try {
-      console.log('📡 正在連接後端分析引擎...');
+      console.log('📡 正在獲取 TOP 25 數據...');
       
       const response = await fetch(`${API_BASE_URL}/sp500-analysis`, {
         method: 'GET',
         headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(180000) // 3分鐘超時
+        signal: AbortSignal.timeout(30000)
       });
       
       if (!response.ok) {
+        if (response.status === 503) {
+          throw new Error('數據正在更新中,請稍後再試');
+        }
         throw new Error(`伺服器回應錯誤: ${response.status}`);
       }
       
       const data = await response.json();
-      console.log('✅ 收到後端數據:', data);
+      console.log('✅ 收到數據:', data);
       
-      /* --- 關鍵的對接邏輯 --- */
-      // 1. 處理股票清單：如果是後端的 'rankings' 則抓取
-      const stocks = data.rankings || data.top_25_stocks || [];
+      // 處理 TOP 25 數據
+      const stocks = data.rankings || [];
       setTop25Stocks(stocks);
       
-      // 2. 處理統計數據：如果後端暫時沒給，我們前端手動計算一個簡單的版本，避免統計區塊空白
+      // 處理統計數據
       if (data.statistics) {
         setStatistics(data.statistics);
-      } else if (stocks.length > 0) {
-        const avgScore = stocks.reduce((acc, curr) => acc + curr.buffettScore, 0) / stocks.length;
-        const avgRisk = stocks.reduce((acc, curr) => acc + curr.totalRisk, 0) / stocks.length;
-        setStatistics({
-          average_score: avgScore.toFixed(1),
-          average_risk: avgRisk.toFixed(1),
-          high_grade_stocks: stocks.filter(s => s.buffettScore > 60).length,
-          sector_distribution: {} // 暫時留空
-        });
+      }
+      
+      // 儲存更新時間
+      if (data.last_update) {
+        setLastUpdate(new Date(data.last_update));
       }
       
     } catch (error) {
       console.error("❌ 獲取失敗:", error);
-      setError("分析引擎啟動中或數據載入超時，請稍候再試 (約需 1 分鐘)");
+      setError(error.message || "無法連接到伺服器,請稍後再試");
     } finally {
       setIsLoading(false);
     }
@@ -82,10 +101,13 @@ const App = () => {
       const response = await fetch(url, {
         method: 'GET',
         headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(180000)
+        signal: AbortSignal.timeout(30000)
       });
       
       if (!response.ok) {
+        if (response.status === 503) {
+          throw new Error('數據正在更新中,請稍後再試');
+        }
         throw new Error(`伺服器回應錯誤: ${response.status}`);
       }
       
@@ -96,7 +118,7 @@ const App = () => {
       
     } catch (error) {
       console.error("❌ 獲取失敗:", error);
-      setError(error.message);
+      setError(error.message || "無法連接到伺服器");
     } finally {
       setIsLoading(false);
     }
@@ -148,6 +170,16 @@ const App = () => {
     return '📊';
   };
 
+  const formatUpdateTime = (date) => {
+    if (!date) return '未知';
+    const now = new Date();
+    const diff = Math.floor((now - date) / 1000 / 60); // 分鐘差
+    
+    if (diff < 60) return `${diff} 分鐘前更新`;
+    if (diff < 1440) return `${Math.floor(diff / 60)} 小時前更新`;
+    return `${Math.floor(diff / 1440)} 天前更新`;
+  };
+
   const displayStocks = activeTab === "top25" 
     ? top25Stocks 
     : sectorData.flatMap(s => s.top_picks);
@@ -155,7 +187,7 @@ const App = () => {
   return (
     <div className="min-h-screen bg-slate-50">
       {/* Header */}
-      <nav className="bg-white border-b border-slate-200 px-6 py-4 shadow-sm">
+      <nav className="bg-white border-b border-slate-200 px-6 py-4 shadow-sm sticky top-0 z-50">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-2 font-black text-xl text-slate-800">
             <Award className="text-blue-600" /> 巴菲特選股系統
@@ -164,8 +196,18 @@ const App = () => {
             {isLoggedIn ? (
               <>
                 <span className="text-sm text-slate-600">{email}</span>
-                <button onClick={exportToCSV} className="flex items-center gap-2 bg-slate-800 text-white px-4 py-2 rounded-full text-sm hover:bg-slate-900 transition">
+                <button 
+                  onClick={exportToCSV} 
+                  className="flex items-center gap-2 bg-slate-800 text-white px-4 py-2 rounded-full text-sm hover:bg-slate-900 transition"
+                  disabled={displayStocks.length === 0}
+                >
                   <Download size={16} /> 導出報告
+                </button>
+                <button 
+                  onClick={handleLogout}
+                  className="text-sm text-slate-500 hover:text-slate-700"
+                >
+                  登出
                 </button>
               </>
             ) : (
@@ -183,12 +225,19 @@ const App = () => {
           <h1 className="text-5xl font-black text-slate-900 mb-4">
             巴菲特 <span className="text-blue-600">TOP 25</span> 股票池
           </h1>
-          <p className="text-slate-600 text-lg mb-8">基於價值投資原則，從科技、金融、民生消費三大產業篩選優質股票</p>
+          <p className="text-slate-600 text-lg mb-2">基於價值投資原則,從科技、金融、民生消費三大產業篩選優質股票</p>
+          
+          {lastUpdate && (
+            <div className="flex items-center justify-center gap-2 text-sm text-slate-500 mb-8">
+              <Clock size={14} />
+              <span>{formatUpdateTime(lastUpdate)} · 每日 UTC 00:00 自動更新</span>
+            </div>
+          )}
           
           {!isLoggedIn ? (
             <div className="bg-gradient-to-br from-blue-600 to-blue-700 rounded-3xl p-8 text-white max-w-2xl mx-auto shadow-2xl">
               <h3 className="text-2xl font-bold mb-2">解鎖巴菲特選股系統</h3>
-              <p className="opacity-90 mb-6">輸入信箱查看完整 TOP 25 股票池與產業分析</p>
+              <p className="opacity-90 mb-6">輸入信箱即可查看每日更新的 TOP 25 股票池與產業分析</p>
               <div className="flex flex-col md:flex-row gap-3">
                 <input 
                   type="email" 
@@ -201,18 +250,24 @@ const App = () => {
                 <button 
                   onClick={handleLogin}
                   disabled={!email.includes("@")}
-                  className="bg-slate-900 px-8 py-4 rounded-2xl font-bold hover:bg-black transition-all disabled:bg-slate-600"
+                  className="bg-slate-900 px-8 py-4 rounded-2xl font-bold hover:bg-black transition-all disabled:bg-slate-600 disabled:cursor-not-allowed"
                 >
                   立即解鎖 <ChevronRight className="inline" size={20} />
                 </button>
               </div>
+              <p className="text-xs opacity-75 mt-4">
+                💡 數據每天自動更新一次,登入後可直接查看結果,無需等待
+              </p>
             </div>
           ) : (
             <>
               {/* Tabs */}
               <div className="flex justify-center gap-4 mb-6">
                 <button 
-                  onClick={() => { setActiveTab("top25"); fetchTop25(); }}
+                  onClick={() => { 
+                    setActiveTab("top25"); 
+                    if (top25Stocks.length === 0) fetchTop25(); 
+                  }}
                   className={`px-6 py-3 rounded-full font-bold transition ${
                     activeTab === "top25" 
                       ? 'bg-blue-600 text-white' 
@@ -222,7 +277,10 @@ const App = () => {
                   🏆 TOP 25 股票池
                 </button>
                 <button 
-                  onClick={() => { setActiveTab("sectors"); fetchSectorData(); }}
+                  onClick={() => { 
+                    setActiveTab("sectors"); 
+                    if (sectorData.length === 0) fetchSectorData(); 
+                  }}
                   className={`px-6 py-3 rounded-full font-bold transition ${
                     activeTab === "sectors" 
                       ? 'bg-blue-600 text-white' 
@@ -239,7 +297,10 @@ const App = () => {
                   {["全部", "科技股", "金融股", "民生消費股"].map(sector => (
                     <button
                       key={sector}
-                      onClick={() => { setSelectedSector(sector); }}
+                      onClick={() => { 
+                        setSelectedSector(sector);
+                        fetchSectorData();
+                      }}
                       className={`px-4 py-2 rounded-full text-sm font-bold transition ${
                         selectedSector === sector
                           ? 'bg-slate-900 text-white'
@@ -270,7 +331,7 @@ const App = () => {
                   <div className="bg-white p-4 rounded-2xl shadow-md">
                     <div className="text-xs text-slate-500 mb-1">產業分布</div>
                     <div className="text-sm font-bold text-slate-700">
-                      {Object.entries(statistics.sector_distribution).map(([k, v]) => (
+                      {Object.entries(statistics.sector_distribution || {}).map(([k, v]) => (
                         <div key={k}>{getSectorIcon(k)} {v}</div>
                       ))}
                     </div>
@@ -279,16 +340,25 @@ const App = () => {
               )}
 
               {error && (
-                <div className="bg-red-50 border border-red-200 text-red-800 px-6 py-3 rounded-2xl mb-6">
-                  <AlertCircle className="inline mr-2" size={16} />
-                  {error}
+                <div className="bg-red-50 border border-red-200 text-red-800 px-6 py-3 rounded-2xl mb-6 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle size={16} />
+                    <span>{error}</span>
+                  </div>
+                  <button 
+                    onClick={() => activeTab === "top25" ? fetchTop25() : fetchSectorData()}
+                    className="text-sm underline hover:no-underline"
+                  >
+                    重試
+                  </button>
                 </div>
               )}
 
               {isLoading && (
                 <div className="text-center py-12">
-                  <Loader2 className="animate-spin mx-auto mb-4" size={48} />
-                  <p className="text-slate-600">分析中... 這可能需要 1-2 分鐘</p>
+                  <Loader2 className="animate-spin mx-auto mb-4 text-blue-600" size={48} />
+                  <p className="text-slate-600">正在載入數據...</p>
+                  <p className="text-sm text-slate-400 mt-2">這應該很快完成 (使用快取數據)</p>
                 </div>
               )}
             </>
@@ -296,7 +366,7 @@ const App = () => {
         </div>
 
         {/* Stock Cards */}
-        {isLoggedIn && !isLoading && (
+        {isLoggedIn && !isLoading && displayStocks.length > 0 && (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {displayStocks.map((stock, idx) => (
               <div key={stock.symbol} className="bg-white rounded-3xl shadow-xl border border-slate-100 overflow-hidden hover:shadow-2xl transition">
@@ -356,7 +426,7 @@ const App = () => {
                         </div>
                         <div className="w-full bg-slate-100 rounded-full h-2">
                           <div 
-                            className="bg-gradient-to-r from-blue-500 to-blue-600 h-full rounded-full"
+                            className="bg-gradient-to-r from-blue-500 to-blue-600 h-full rounded-full transition-all"
                             style={{ width: `${Math.min(value, 100)}%` }}
                           />
                         </div>
@@ -372,7 +442,9 @@ const App = () => {
                     </div>
                     <div className="bg-slate-50 p-3 rounded-xl">
                       <div className="text-xs text-slate-400 font-bold">P/E</div>
-                      <div className="text-lg font-black text-slate-700">{stock.pe?.toFixed(1)}</div>
+                      <div className="text-lg font-black text-slate-700">
+                        {typeof stock.pe === 'number' ? stock.pe.toFixed(1) : stock.pe}
+                      </div>
                     </div>
                   </div>
 
@@ -383,6 +455,22 @@ const App = () => {
                 </div>
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Empty State */}
+        {isLoggedIn && !isLoading && displayStocks.length === 0 && (
+          <div className="text-center py-12">
+            <div className="text-6xl mb-4">📊</div>
+            <h3 className="text-xl font-bold text-slate-700 mb-2">暫無數據</h3>
+            <p className="text-slate-500 mb-4">請點擊上方按鈕載入數據</p>
+            <button
+              onClick={() => activeTab === "top25" ? fetchTop25() : fetchSectorData()}
+              className="bg-blue-600 text-white px-6 py-3 rounded-full font-bold hover:bg-blue-700 transition"
+            >
+              <RefreshCw size={16} className="inline mr-2" />
+              載入數據
+            </button>
           </div>
         )}
       </main>
