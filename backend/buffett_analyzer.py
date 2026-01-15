@@ -1,12 +1,12 @@
 """
-Buffett Stock Picker - 巴菲特選股系統 (Render 部署版)
-完整後端代碼 - 支援自動快取與即時分析
+Buffett Stock Picker - 巴菲特選股系統
+完整後端代碼 - 修復 JSON 序列化問題
 """
 import os
 import logging
 import random
 import asyncio
-from typing import List, Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple
 from datetime import datetime, timedelta, time as dt_time
 from contextlib import asynccontextmanager
 import json
@@ -18,13 +18,11 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 import time
 
 # ==================== 配置管理 ====================
 
 class Config:
-    """集中管理所有配置參數"""
     CACHE_PATH = "./yfinance_stock_cache"
     CACHE_EXPIRE_SECONDS = 86400
     DAILY_CACHE_PATH = "./daily_analysis_cache.json"
@@ -32,12 +30,12 @@ class Config:
     MIN_REQUEST_DELAY = 0
     MIN_HISTORY_DAYS = 5
     MIN_INFO_FIELDS = 1
-    MAX_CONCURRENT_REQUESTS = 50
+    MAX_CONCURRENT_REQUESTS = 30
     DAILY_UPDATE_HOUR = 0
     DAILY_UPDATE_MINUTE = 0
     API_TITLE = "Buffett Stock Picker API"
-    API_VERSION = "5.0"
-    API_DESCRIPTION = "巴菲特選股系統 - Render 部署版"
+    API_VERSION = "5.2"
+    API_DESCRIPTION = "巴菲特選股系統 - 完整版"
 
 config = Config()
 
@@ -45,11 +43,34 @@ config = Config()
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ==================== 每日快取管理器 ====================
+# ==================== JSON 序列化助手 ====================
+
+def convert_to_serializable(obj):
+    """將所有數據轉換為 JSON 可序列化格式"""
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (bool, int, float, str)) or obj is None:
+        return obj
+    elif hasattr(obj, '__dict__'):
+        return convert_to_serializable(obj.__dict__)
+    else:
+        return str(obj)
+
+# ==================== 快取管理器 ====================
 
 class DailyCacheManager:
     """管理每日分析結果的快取"""
@@ -68,24 +89,35 @@ class DailyCacheManager:
                     data = json.load(f)
                     self.cache_data = data
                     self.last_update = datetime.fromisoformat(data.get('last_update', ''))
-                    logger.info(f"✅ 載入快取成功,上次更新: {self.last_update}")
+                    logger.info(f"✅ 載入快取成功 - 更新時間: {self.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
                     return data
         except Exception as e:
             logger.error(f"❌ 載入快取失敗: {e}")
         return None
     
     def save_cache(self, data: dict):
-        """儲存快取資料"""
+        """儲存快取資料 - 確保所有數據都可序列化"""
         try:
+            # 轉換所有數據為可序列化格式
+            serializable_data = convert_to_serializable(data)
+            
             cache_data = {
                 'last_update': datetime.now().isoformat(),
-                'data': data
+                'data': serializable_data
             }
             
-            os.makedirs(os.path.dirname(self.cache_path) if os.path.dirname(self.cache_path) else '.', exist_ok=True)
+            # 確保目錄存在
+            cache_dir = os.path.dirname(self.cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
             
-            with open(self.cache_path, 'w', encoding='utf-8') as f:
+            # 先寫入臨時文件,再重命名(原子操作)
+            temp_path = self.cache_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            
+            # 重命名為正式文件
+            os.replace(temp_path, self.cache_path)
             
             self.cache_data = cache_data
             self.last_update = datetime.now()
@@ -93,12 +125,13 @@ class DailyCacheManager:
             
         except Exception as e:
             logger.error(f"❌ 儲存快取失敗: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def is_cache_valid(self) -> bool:
-        """檢查快取是否仍然有效 (當日有效)"""
+        """檢查快取是否仍然有效"""
         if not self.last_update:
             return False
-        
         now = datetime.now()
         return (
             self.last_update.date() == now.date() and
@@ -110,7 +143,6 @@ class DailyCacheManager:
         if self.is_cache_valid():
             logger.info("✅ 使用快取資料")
             return self.cache_data.get('data')
-        
         logger.info("⚠️ 快取已過期或不存在")
         return None
 
@@ -164,8 +196,6 @@ STOCK_POOLS = {
 # ==================== 速率限制器 ====================
 
 class RateLimiter:
-    """改進的速率限制器"""
-    
     def __init__(self):
         self.requests = []
         self.semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
@@ -198,8 +228,6 @@ rate_limiter = RateLimiter()
 # ==================== 資料獲取優化 ====================
 
 class DataFetcher:
-    """優化的資料獲取器"""
-    
     @staticmethod
     async def fetch_stock_data(symbol: str) -> Tuple[Optional[dict], Optional[pd.DataFrame]]:
         max_retries = 2
@@ -247,18 +275,16 @@ class DataFetcher:
         rev_growth = (info.get('revenueGrowth', 0) or 0) * 100
         
         return {
-            'roe': roe,
-            'pe': pe,
-            'profit_margin': profit_margin,
-            'debt_to_equity': debt_to_equity,
-            'revenue_growth': rev_growth
+            'roe': float(roe),
+            'pe': float(pe),
+            'profit_margin': float(profit_margin),
+            'debt_to_equity': float(debt_to_equity),
+            'revenue_growth': float(rev_growth)
         }
 
 # ==================== 巴菲特選股引擎 ====================
 
 class BuffettStockPicker:
-    """巴菲特選股引擎"""
-    
     BUFFETT_CRITERIA = {
         "roe": {"threshold": 15, "label": "股東權益報酬率 (ROE)", "unit": "%", "operator": ">="},
         "pe": {"threshold": 25, "label": "本益比 (P/E)", "unit": "", "operator": "<="},
@@ -282,27 +308,27 @@ class BuffettStockPicker:
             momentum = {}
             
             if len(hist) < 21:
-                return {'1y': 0, '6m': 0, '1m': 0}
+                return {'1y': 0.0, '6m': 0.0, '1m': 0.0}
             
-            one_year_ago = hist['Close'].iloc[0]
-            momentum['1y'] = ((current_price - one_year_ago) / one_year_ago) * 100
+            one_year_ago = float(hist['Close'].iloc[0])
+            momentum['1y'] = float(((current_price - one_year_ago) / one_year_ago) * 100)
             
             half_year_idx = max(0, len(hist) // 2)
-            six_months_ago = hist['Close'].iloc[half_year_idx]
-            momentum['6m'] = ((current_price - six_months_ago) / six_months_ago) * 100
+            six_months_ago = float(hist['Close'].iloc[half_year_idx])
+            momentum['6m'] = float(((current_price - six_months_ago) / six_months_ago) * 100)
             
             one_month_idx = max(0, len(hist) - 21)
-            one_month_ago = hist['Close'].iloc[one_month_idx]
-            momentum['1m'] = ((current_price - one_month_ago) / one_month_ago) * 100
+            one_month_ago = float(hist['Close'].iloc[one_month_idx])
+            momentum['1m'] = float(((current_price - one_month_ago) / one_month_ago) * 100)
             
             return momentum
             
         except Exception as e:
-            return {'1y': 0, '6m': 0, '1m': 0}
+            return {'1y': 0.0, '6m': 0.0, '1m': 0.0}
     
     def _calculate_technical_indicators(self, hist: pd.DataFrame) -> Dict[str, float]:
-        ma200 = hist['Close'].rolling(window=200, min_periods=1).mean().iloc[-1]
-        ma50 = hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1]
+        ma200 = float(hist['Close'].rolling(window=200, min_periods=1).mean().iloc[-1])
+        ma50 = float(hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1])
         return {'ma200': ma200, 'ma50': ma50}
     
     def _assess_market_phase(self, current_price: float, ma200: float, ma50: float) -> str:
@@ -362,7 +388,7 @@ class BuffettStockPicker:
         if market_phase == "空頭趨勢":
             final_score *= 0.85
         
-        return max(0, min(100, final_score))
+        return float(max(0, min(100, final_score)))
     
     def _calculate_risk_score(self, metrics: dict, hist: pd.DataFrame) -> Tuple[float, Dict[str, float]]:
         debt_r = min(100, metrics['debt_to_equity'] * 50)
@@ -371,14 +397,14 @@ class BuffettStockPicker:
         val_r = 100 if pe >= 100 else (pe / 40) * 100
         
         returns = hist['Close'].pct_change().dropna()
-        vol_r = (returns.std() * np.sqrt(252) * 100) if len(returns) > 20 else 50
+        vol_r = (float(returns.std()) * np.sqrt(252) * 100) if len(returns) > 20 else 50
         
         total_risk = min(100, debt_r * 0.4 + val_r * 0.4 + vol_r * 0.2)
         
-        return total_risk, {
-            'debt': round(debt_r, 1),
-            'valuation': round(val_r, 1),
-            'volatility': round(vol_r, 1)
+        return float(total_risk), {
+            'debt': float(round(debt_r, 1)),
+            'valuation': float(round(val_r, 1)),
+            'volatility': float(round(vol_r, 1))
         }
     
     async def analyze(self) -> Optional[dict]:
@@ -396,11 +422,13 @@ class BuffettStockPicker:
                 current_price = (
                     info.get('currentPrice') or
                     info.get('regularMarketPrice') or
-                    hist['Close'].iloc[-1]
+                    float(hist['Close'].iloc[-1])
                 )
                 
                 if not current_price or current_price <= 0:
                     return None
+                
+                current_price = float(current_price)
                 
                 metrics = self.data_fetcher.normalize_financial_metrics(info)
                 momentum = self._calculate_momentum(hist, current_price)
@@ -414,11 +442,11 @@ class BuffettStockPicker:
                 is_positive_momentum = momentum['6m'] > 0 and momentum['1m'] > -5
                 
                 buffett_criteria = {
-                    "high_roe": metrics['roe'] >= self.BUFFETT_CRITERIA["roe"]["threshold"],
-                    "reasonable_pe": 0 < metrics['pe'] <= self.BUFFETT_CRITERIA["pe"]["threshold"],
-                    "low_debt": metrics['debt_to_equity'] <= self.BUFFETT_CRITERIA["debt_to_equity"]["threshold"],
-                    "profitable": metrics['profit_margin'] >= self.BUFFETT_CRITERIA["profit_margin"]["threshold"],
-                    "positive_momentum": is_positive_momentum
+                    "high_roe": bool(metrics['roe'] >= self.BUFFETT_CRITERIA["roe"]["threshold"]),
+                    "reasonable_pe": bool(0 < metrics['pe'] <= self.BUFFETT_CRITERIA["pe"]["threshold"]),
+                    "low_debt": bool(metrics['debt_to_equity'] <= self.BUFFETT_CRITERIA["debt_to_equity"]["threshold"]),
+                    "profitable": bool(metrics['profit_margin'] >= self.BUFFETT_CRITERIA["profit_margin"]["threshold"]),
+                    "positive_momentum": bool(is_positive_momentum)
                 }
                 
                 criteria_passed = sum(1 for v in buffett_criteria.values() if v)
@@ -446,30 +474,31 @@ class BuffettStockPicker:
                 
                 logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {final_score:.1f}")
                 
+                # 確保所有值都是基本 Python 類型
                 return {
-                    "symbol": self.symbol,
-                    "companyName": company_name,
-                    "sector": self.sector,
-                    "buffettScore": round(float(final_score), 1),
-                    "currentPrice": round(float(current_price), 2),
-                    "momentum": round(float(momentum['1y']), 2),
-                    "totalRisk": round(float(total_risk), 1),
-                    "roe": round(float(metrics['roe']), 2),
-                    "pe": round(float(metrics['pe']), 2) if metrics['pe'] < 500 else "N/A",
-                    "recommendation": recommendation,
-                    "marketPhase": market_phase,
+                    "symbol": str(self.symbol),
+                    "companyName": str(company_name),
+                    "sector": str(self.sector),
+                    "buffettScore": float(round(final_score, 1)),
+                    "currentPrice": float(round(current_price, 2)),
+                    "momentum": float(round(momentum['1y'], 2)),
+                    "totalRisk": float(round(total_risk, 1)),
+                    "roe": float(round(metrics['roe'], 2)),
+                    "pe": float(round(metrics['pe'], 2)) if metrics['pe'] < 500 else "N/A",
+                    "recommendation": str(recommendation),
+                    "marketPhase": str(market_phase),
                     "factors": factor_scores,
                     "risks": risk_breakdown,
                     "buffettCriteria": {
-                        "grade": buffett_grade,
-                        "criteria_passed": criteria_passed,
-                        "details": buffett_criteria
+                        "grade": str(buffett_grade),
+                        "criteria_passed": int(criteria_passed),
+                        "details": {k: bool(v) for k, v in buffett_criteria.items()}
                     },
                     "details": {
-                        "ma200": round(float(tech_indicators['ma200']), 2),
-                        "profit_margin": round(float(metrics['profit_margin']), 2),
-                        "debt_to_equity": round(float(metrics['debt_to_equity']), 2),
-                        "momentum_6m": round(float(momentum['6m']), 2),
+                        "ma200": float(round(tech_indicators['ma200'], 2)),
+                        "profit_margin": float(round(metrics['profit_margin'], 2)),
+                        "debt_to_equity": float(round(metrics['debt_to_equity'], 2)),
+                        "momentum_6m": float(round(momentum['6m'], 2)),
                         "timestamp": datetime.now().isoformat()
                     }
                 }
@@ -508,15 +537,15 @@ async def perform_full_analysis() -> Optional[dict]:
         top_25 = all_stocks[:25]
         
         sectors_count = {}
-        total_score = 0
-        total_risk = 0
+        total_score = 0.0
+        total_risk = 0.0
         high_grade_count = 0
         
         for stock in top_25:
             sector = stock.get('sector', '未知')
             sectors_count[sector] = sectors_count.get(sector, 0) + 1
-            total_score += stock.get('buffettScore', 0)
-            total_risk += stock.get('totalRisk', 0)
+            total_score += float(stock.get('buffettScore', 0))
+            total_risk += float(stock.get('totalRisk', 0))
             
             criteria = stock.get('buffettCriteria', {})
             if criteria.get('grade') in ['A+', 'A']:
@@ -530,12 +559,12 @@ async def perform_full_analysis() -> Optional[dict]:
             sector_stocks.sort(key=lambda x: x['buffettScore'], reverse=True)
             
             avg_score = (
-                sum(s['buffettScore'] for s in sector_stocks) / len(sector_stocks)
-                if sector_stocks else 0
+                sum(float(s['buffettScore']) for s in sector_stocks) / len(sector_stocks)
+                if sector_stocks else 0.0
             )
             avg_risk = (
-                sum(s['totalRisk'] for s in sector_stocks) / len(sector_stocks)
-                if sector_stocks else 0
+                sum(float(s['totalRisk']) for s in sector_stocks) / len(sector_stocks)
+                if sector_stocks else 0.0
             )
             
             sector_risk = (
@@ -544,14 +573,14 @@ async def perform_full_analysis() -> Optional[dict]:
             )
             
             sector_analysis.append({
-                "sector": sector_name,
-                "description": pool["description"],
-                "total_stocks": len(pool["symbols"]),
-                "analyzed_stocks": len(sector_stocks),
+                "sector": str(sector_name),
+                "description": str(pool["description"]),
+                "total_stocks": int(len(pool["symbols"])),
+                "analyzed_stocks": int(len(sector_stocks)),
                 "top_picks": sector_stocks[:10],
-                "average_score": round(avg_score, 1),
-                "average_risk": round(avg_risk, 1),
-                "sector_risk": sector_risk
+                "average_score": float(round(avg_score, 1)),
+                "average_risk": float(round(avg_risk, 1)),
+                "sector_risk": str(sector_risk)
             })
         
         cache_manager.is_analyzing = False
@@ -561,14 +590,14 @@ async def perform_full_analysis() -> Optional[dict]:
                 "status": "success",
                 "title": "巴菲特 TOP 25 股票池",
                 "description": "基於價值投資原則篩選的優質股票",
-                "total_analyzed": len(all_stocks),
+                "total_analyzed": int(len(all_stocks)),
                 "rankings": top_25,
                 "statistics": {
-                    "average_score": round(total_score / count, 1) if count > 0 else 0,
-                    "average_risk": round(total_risk / count, 1) if count > 0 else 0,
-                    "high_grade_stocks": high_grade_count,
-                    "sector_distribution": sectors_count,
-                    "count": count
+                    "average_score": float(round(total_score / count, 1)) if count > 0 else 0.0,
+                    "average_risk": float(round(total_risk / count, 1)) if count > 0 else 0.0,
+                    "high_grade_stocks": int(high_grade_count),
+                    "sector_distribution": {str(k): int(v) for k, v in sectors_count.items()},
+                    "count": int(count)
                 },
                 "criteria": BuffettStockPicker.BUFFETT_CRITERIA,
                 "last_update": datetime.now().isoformat()
@@ -578,6 +607,8 @@ async def perform_full_analysis() -> Optional[dict]:
         
     except Exception as e:
         logger.error(f"❌ 完整分析失敗: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         cache_manager.is_analyzing = False
         return None
 
