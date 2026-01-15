@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, RefreshCw, Award, DollarSign, Activity, Shield, Zap, AlertCircle } from 'lucide-react';
+import { TrendingUp, RefreshCw, Award, DollarSign, Activity, Shield, Zap, AlertCircle, Clock } from 'lucide-react';
 
 // 模擬數據
 const MOCK_DATA = {
   top25: {
     status: "success",
-    total_analyzed: 69,
+    total_analyzed: 64,
     last_update: new Date().toISOString(),
     rankings: [
       {
@@ -103,45 +103,13 @@ const MOCK_DATA = {
         factors: { value: 82, quality: 95, momentum: 78, growth: 75 },
         risks: { debt: 15.2, valuation: 42.5, volatility: 18.5 },
         buffettCriteria: { grade: "A", criteria_passed: 4 }
-      },
-      {
-        symbol: "MA",
-        companyName: "Mastercard Inc.",
-        sector: "金融股",
-        buffettScore: 80.5,
-        currentPrice: 475.22,
-        momentum: 28.8,
-        totalRisk: 24.5,
-        roe: 152.8,
-        pe: 38.5,
-        recommendation: "優質標的 ⭐⭐",
-        marketPhase: "多頭排列",
-        factors: { value: 78, quality: 100, momentum: 82, growth: 72 },
-        risks: { debt: 12.5, valuation: 48.2, volatility: 19.8 },
-        buffettCriteria: { grade: "A", criteria_passed: 3 }
-      },
-      {
-        symbol: "WMT",
-        companyName: "Walmart Inc.",
-        sector: "民生消費股",
-        buffettScore: 78.3,
-        currentPrice: 72.85,
-        momentum: 18.5,
-        totalRisk: 18.5,
-        roe: 22.5,
-        pe: 28.5,
-        recommendation: "優質標的 ⭐⭐",
-        marketPhase: "多頭排列",
-        factors: { value: 82, quality: 88, momentum: 72, growth: 68 },
-        risks: { debt: 22.5, valuation: 38.5, volatility: 12.8 },
-        buffettCriteria: { grade: "B", criteria_passed: 3 }
       }
     ],
     statistics: {
-      average_score: 81.8,
-      average_risk: 28.8,
+      average_score: 85.8,
+      average_risk: 31.2,
       high_grade_stocks: 18,
-      sector_distribution: { "科技股": 12, "金融股": 8, "民生消費股": 5 },
+      sector_distribution: { "科技股": 12, "金融股": 8, "民生消費股": 4 },
       count: 25
     }
   },
@@ -149,8 +117,8 @@ const MOCK_DATA = {
     {
       sector: "科技股",
       description: "科技創新類股票",
-      total_stocks: 23,
-      analyzed_stocks: 23,
+      total_stocks: 21,
+      analyzed_stocks: 21,
       average_score: 79.5,
       average_risk: 35.2,
       sector_risk: "中風險",
@@ -169,29 +137,14 @@ const MOCK_DATA = {
           marketPhase: "多頭排列",
           factors: { value: 75, quality: 95, momentum: 92, growth: 98 },
           buffettCriteria: { grade: "A+", criteria_passed: 4 }
-        },
-        {
-          symbol: "MSFT",
-          companyName: "Microsoft Corporation",
-          sector: "科技股",
-          buffettScore: 88.3,
-          currentPrice: 420.55,
-          momentum: 32.8,
-          totalRisk: 28.3,
-          roe: 42.3,
-          pe: 35.2,
-          recommendation: "強力推薦 ⭐⭐⭐",
-          marketPhase: "多頭排列",
-          factors: { value: 82, quality: 98, momentum: 85, growth: 88 },
-          buffettCriteria: { grade: "A+", criteria_passed: 5 }
         }
       ]
     },
     {
       sector: "金融股",
       description: "銀行、保險與金融服務",
-      total_stocks: 23,
-      analyzed_stocks: 23,
+      total_stocks: 22,
+      analyzed_stocks: 22,
       average_score: 75.2,
       average_risk: 28.5,
       sector_risk: "低風險",
@@ -216,28 +169,12 @@ const MOCK_DATA = {
     {
       sector: "民生消費股",
       description: "日常消費與零售",
-      total_stocks: 23,
-      analyzed_stocks: 23,
+      total_stocks: 21,
+      analyzed_stocks: 21,
       average_score: 72.8,
       average_risk: 22.5,
       sector_risk: "低風險",
-      top_picks: [
-        {
-          symbol: "WMT",
-          companyName: "Walmart Inc.",
-          sector: "民生消費股",
-          buffettScore: 78.3,
-          currentPrice: 72.85,
-          momentum: 18.5,
-          totalRisk: 18.5,
-          roe: 22.5,
-          pe: 28.5,
-          recommendation: "優質標的 ⭐⭐",
-          marketPhase: "多頭排列",
-          factors: { value: 82, quality: 88, momentum: 72, growth: 68 },
-          buffettCriteria: { grade: "B", criteria_passed: 3 }
-        }
-      ]
+      top_picks: []
     }
   ]
 };
@@ -251,23 +188,37 @@ const BuffettStockPicker = () => {
   const [lastUpdate, setLastUpdate] = useState(null);
   const [selectedSector, setSelectedSector] = useState(null);
   const [useRealAPI, setUseRealAPI] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
 
   const API_BASE = 'https://buffett-analyzer.onrender.com';
 
-  const fetchData = async () => {
+  const fetchData = async (currentRetry = 0) => {
     try {
       setLoading(true);
       setError(null);
 
       if (useRealAPI) {
-        // 嘗試連接真實 API
         const [top25Res, sectorsRes] = await Promise.all([
           fetch(`${API_BASE}/sp500-analysis`),
           fetch(`${API_BASE}/api/stock-pool`)
         ]);
 
+        // 處理 202 狀態 (分析中)
+        if (top25Res.status === 202 || sectorsRes.status === 202) {
+          if (currentRetry < 5) {
+            const waitTime = 10 + (currentRetry * 5);
+            setError(`後端正在分析數據... 第 ${currentRetry + 1}/5 次重試 (${waitTime}秒後)`);
+            setRetryCount(currentRetry + 1);
+            setTimeout(() => fetchData(currentRetry + 1), waitTime * 1000);
+            return;
+          } else {
+            throw new Error('後端分析超時,請稍後手動刷新或切換到示範模式');
+          }
+        }
+
         if (!top25Res.ok || !sectorsRes.ok) {
-          throw new Error('無法連接到後端服務');
+          const errorText = await top25Res.text();
+          throw new Error(`API 錯誤: ${top25Res.status}`);
         }
 
         const top25 = await top25Res.json();
@@ -276,8 +227,8 @@ const BuffettStockPicker = () => {
         setTop25Data(top25);
         setSectorsData(sectors);
         setLastUpdate(new Date(top25.last_update));
+        setRetryCount(0);
       } else {
-        // 使用模擬數據
         setTimeout(() => {
           setTop25Data(MOCK_DATA.top25);
           setSectorsData(MOCK_DATA.sectors);
@@ -291,6 +242,7 @@ const BuffettStockPicker = () => {
     } catch (err) {
       setError(err.message);
       setLoading(false);
+      setRetryCount(0);
     }
   };
 
@@ -302,10 +254,21 @@ const BuffettStockPicker = () => {
     if (useRealAPI) {
       try {
         setLoading(true);
-        await fetch(`${API_BASE}/api/refresh`, { method: 'POST' });
-        setTimeout(() => fetchData(), 3000);
+        setError('正在觸發後端重新分析...');
+        const res = await fetch(`${API_BASE}/api/refresh`, { method: 'POST' });
+        
+        if (res.ok) {
+          const data = await res.json();
+          setError(`${data.message} - 預計 ${data.estimated_time}`);
+          setTimeout(() => {
+            setError('正在獲取結果...');
+            fetchData(0);
+          }, 15000);
+        } else {
+          throw new Error('刷新請求失敗');
+        }
       } catch (err) {
-        setError('刷新失敗');
+        setError(`刷新失敗: ${err.message}`);
         setLoading(false);
       }
     } else {
@@ -448,35 +411,58 @@ const BuffettStockPicker = () => {
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-purple-50 flex items-center justify-center">
         <div className="text-center">
           <RefreshCw className="w-12 h-12 text-blue-600 animate-spin mx-auto mb-4" />
-          <p className="text-gray-600">載入數據中...</p>
+          <p className="text-gray-600 font-medium">載入數據中...</p>
+          {retryCount > 0 && (
+            <div className="mt-3 flex items-center justify-center gap-2 text-sm text-gray-500">
+              <Clock className="w-4 h-4" />
+              <span>重試進度: {retryCount}/5</span>
+            </div>
+          )}
+          {error && <p className="text-blue-600 text-sm mt-2">{error}</p>}
         </div>
       </div>
     );
   }
 
-  if (error) {
+  if (error && !loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-purple-50 flex items-center justify-center">
-        <div className="bg-white rounded-lg shadow-lg p-8 max-w-md">
+      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-purple-50 flex items-center justify-center p-4">
+        <div className="bg-white rounded-lg shadow-lg p-8 max-w-md w-full">
           <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
           <h2 className="text-xl font-bold mb-2 text-center">載入失敗</h2>
-          <p className="text-gray-600 text-center mb-4">{error}</p>
-          <button
-            onClick={fetchData}
-            className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 mb-2"
-          >
-            重試
-          </button>
-          <button
-            onClick={() => {
-              setUseRealAPI(false);
-              setError(null);
-              fetchData();
-            }}
-            className="w-full bg-gray-600 text-white py-2 rounded-lg hover:bg-gray-700"
-          >
-            使用示範數據
-          </button>
+          <p className="text-gray-600 text-center mb-4 text-sm">{error}</p>
+          <div className="space-y-2">
+            <button
+              onClick={() => {
+                setError(null);
+                fetchData(0);
+              }}
+              className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              重試連接
+            </button>
+            {useRealAPI && (
+              <button
+                onClick={handleRefresh}
+                className="w-full bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 transition-colors"
+              >
+                觸發後端更新
+              </button>
+            )}
+            <button
+              onClick={() => {
+                setUseRealAPI(false);
+                setError(null);
+                setRetryCount(0);
+              }}
+              className="w-full bg-gray-600 text-white py-2 rounded-lg hover:bg-gray-700 transition-colors"
+            >
+              切換到示範模式
+            </button>
+          </div>
+          <p className="text-xs text-gray-500 mt-4 text-center">
+            💡 首次啟動或快取過期時,後端需要 1-2 分鐘重新分析數據
+          </p>
         </div>
       </div>
     );
@@ -486,7 +472,7 @@ const BuffettStockPicker = () => {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 via-purple-50 to-pink-50">
       <div className="bg-white shadow border-b">
         <div className="max-w-7xl mx-auto px-4 py-4">
-          <div className="flex justify-between items-center">
+          <div className="flex justify-between items-center flex-wrap gap-3">
             <div>
               <h1 className="text-2xl font-bold flex items-center gap-2">
                 <TrendingUp className="w-7 h-7 text-blue-600" />
@@ -501,14 +487,17 @@ const BuffettStockPicker = () => {
             </div>
             <div className="flex gap-2">
               <button
-                onClick={() => setUseRealAPI(!useRealAPI)}
-                className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
+                onClick={() => {
+                  setUseRealAPI(!useRealAPI);
+                  setRetryCount(0);
+                }}
+                className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm transition-colors"
               >
-                {useRealAPI ? '示範模式' : '真實 API'}
+                {useRealAPI ? '切換示範' : '連接 API'}
               </button>
               <button
                 onClick={handleRefresh}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
                 刷新
@@ -545,7 +534,7 @@ const BuffettStockPicker = () => {
         <div className="bg-white rounded-lg shadow p-1 inline-flex gap-1">
           <button
             onClick={() => setActiveTab('top25')}
-            className={`px-6 py-2 rounded font-medium ${
+            className={`px-6 py-2 rounded font-medium transition-colors ${
               activeTab === 'top25'
                 ? 'bg-blue-600 text-white'
                 : 'text-gray-600 hover:bg-gray-100'
@@ -555,7 +544,7 @@ const BuffettStockPicker = () => {
           </button>
           <button
             onClick={() => setActiveTab('sectors')}
-            className={`px-6 py-2 rounded font-medium ${
+            className={`px-6 py-2 rounded font-medium transition-colors ${
               activeTab === 'sectors'
                 ? 'bg-blue-600 text-white'
                 : 'text-gray-600 hover:bg-gray-100'
@@ -587,7 +576,7 @@ const BuffettStockPicker = () => {
               <div>
                 <button
                   onClick={() => setSelectedSector(null)}
-                  className="mb-4 text-blue-600 hover:text-blue-700 font-medium"
+                  className="mb-4 text-blue-600 hover:text-blue-700 font-medium transition-colors"
                 >
                   ← 返回
                 </button>
