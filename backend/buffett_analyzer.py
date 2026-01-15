@@ -1,6 +1,6 @@
 """
-Buffett Stock Picker - 巴菲特選股系統 (每日快取版)
-每天自動計算一次,使用者直接讀取結果,無需等待
+Buffett Stock Picker - 巴菲特選股系統 (Render 部署版)
+完整後端代碼 - 支援自動快取與即時分析
 """
 import os
 import logging
@@ -8,10 +8,8 @@ import random
 import asyncio
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, timedelta, time as dt_time
-from functools import lru_cache
 from contextlib import asynccontextmanager
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -20,39 +18,26 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 import time
 
 # ==================== 配置管理 ====================
 
 class Config:
     """集中管理所有配置參數"""
-    # 快取設定
     CACHE_PATH = "./yfinance_stock_cache"
     CACHE_EXPIRE_SECONDS = 86400
-    
-    # 每日分析結果儲存路徑
     DAILY_CACHE_PATH = "./daily_analysis_cache.json"
-    
-    # 速率限制
     MAX_REQUESTS_PER_MINUTE = 500
     MIN_REQUEST_DELAY = 0
-    
-    # 資料要求
     MIN_HISTORY_DAYS = 5
     MIN_INFO_FIELDS = 1
-    
-    # 並行控制
     MAX_CONCURRENT_REQUESTS = 50
-    
-    # 每日更新時間 (UTC 時間,午夜 00:00)
     DAILY_UPDATE_HOUR = 0
     DAILY_UPDATE_MINUTE = 0
-    
-    # API 設定
     API_TITLE = "Buffett Stock Picker API"
-    API_VERSION = "4.0"
-    API_DESCRIPTION = "巴菲特選股系統 - 每日自動更新版"
+    API_VERSION = "5.0"
+    API_DESCRIPTION = "巴菲特選股系統 - Render 部署版"
 
 config = Config()
 
@@ -73,6 +58,7 @@ class DailyCacheManager:
         self.cache_path = cache_path
         self.cache_data = None
         self.last_update = None
+        self.is_analyzing = False
         
     def load_cache(self) -> Optional[dict]:
         """載入快取資料"""
@@ -96,8 +82,7 @@ class DailyCacheManager:
                 'data': data
             }
             
-            # 確保目錄存在
-            os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+            os.makedirs(os.path.dirname(self.cache_path) if os.path.dirname(self.cache_path) else '.', exist_ok=True)
             
             with open(self.cache_path, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
@@ -115,7 +100,6 @@ class DailyCacheManager:
             return False
         
         now = datetime.now()
-        # 如果是同一天的快取,視為有效
         return (
             self.last_update.date() == now.date() and
             self.cache_data is not None
@@ -142,120 +126,7 @@ session = requests_cache.CachedSession(
 )
 
 START_TIME = time.time()
-
-# 全域變數儲存背景任務
 background_task = None
-
-async def daily_update_task():
-    """每日定時更新任務"""
-    while True:
-        try:
-            now = datetime.now()
-            
-            # 計算下次更新時間 (今天或明天的指定時間)
-            next_update = datetime.combine(
-                now.date(),
-                dt_time(config.DAILY_UPDATE_HOUR, config.DAILY_UPDATE_MINUTE)
-            )
-            
-            # 如果今天的更新時間已過,改為明天
-            if now >= next_update:
-                next_update += timedelta(days=1)
-            
-            wait_seconds = (next_update - now).total_seconds()
-            logger.info(f"⏰ 下次更新時間: {next_update.strftime('%Y-%m-%d %H:%M:%S')} (等待 {wait_seconds/3600:.1f} 小時)")
-            
-            # 等待到下次更新時間
-            await asyncio.sleep(wait_seconds)
-            
-            # 執行分析
-            logger.info("🚀 開始每日自動分析...")
-            result = await perform_full_analysis()
-            
-            if result:
-                cache_manager.save_cache(result)
-                logger.info("✅ 每日分析完成並已快取")
-            else:
-                logger.error("❌ 每日分析失敗")
-                
-        except Exception as e:
-            logger.error(f"❌ 每日更新任務錯誤: {e}")
-            # 發生錯誤時等待 1 小時後重試
-            await asyncio.sleep(3600)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """應用生命週期管理 - 啟動時自動列印分析結果"""
-    global background_task
-    
-    logger.info("🚀 巴菲特選股系統啟動中...")
-    
-    # 1. 載入或執行分析
-    cache_manager.load_cache()
-    
-    # 如果快取無效（或者是新的一天），執行分析
-    if not cache_manager.is_cache_valid():
-        logger.info("⚠️ 快取無效或已過期，正在抓取最新市場數據...")
-        result = await perform_full_analysis()
-        if result:
-            cache_manager.save_cache(result)
-    
-    # 2. 從快取中提取資料並列印到終端機
-    current_data = cache_manager.get_cached_data()
-    if current_data and 'top_25' in current_data:
-        rankings = current_data['top_25'].get('rankings', [])
-        
-        print("\n" + "="*60)
-        print(f"  🏆 巴菲特選股排行榜 (更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M')})")
-        print("="*60)
-        print(f"{'排名':<4} {'代號':<8} {'公司名稱':<20} {'評分':<6} {'等級':<4}")
-        print("-"*60)
-        
-        for i, stock in enumerate(rankings[:15], 1): # 列印前 15 名
-            score = stock.get('buffettScore', 0)
-            grade = stock.get('buffettCriteria', {}).get('grade', 'N/A')
-            symbol = stock.get('symbol', 'N/A')
-            name = stock.get('companyName', 'N/A')[:18] # 截斷過長的名字
-            
-            # 根據評分給予簡單的視覺標記
-            marker = "⭐" if score > 85 else "  "
-            print(f"{i:<4} {symbol:<8} {name:<20} {score:<8.1f} {grade:<4} {marker}")
-        
-        print("-"*60)
-        stats = current_data['top_25'].get('statistics', {})
-        print(f"📊 統計: 已分析 {stats.get('count', 0)} 支股票 | 優質(A級以上): {stats.get('high_grade_stocks', 0)} 支")
-        print("="*60 + "\n")
-    else:
-        logger.warning("❌ 無法顯示啟動數據，請確認網路連線或代號設定。")
-
-    # 啟動背景定時更新任務
-    background_task = asyncio.create_task(daily_update_task())
-    logger.info("✅ 每日定時更新任務已就緒")
-    
-    yield
-    
-    if background_task:
-        background_task.cancel()
-    logger.info("👋 系統正在關閉...")
-
-# ==================== FastAPI 初始化 ====================
-
-app = FastAPI(
-    title=config.API_TITLE,
-    version=config.API_VERSION,
-    description=config.API_DESCRIPTION,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
 
 # ==================== 股票池定義 ====================
 
@@ -264,33 +135,33 @@ STOCK_POOLS = {
         "description": "科技創新類股票",
         "symbols": [
             "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD",
-            "CRM", "ADBE", "ORCL", "SAP", "SNOW", "PLTR",
+            "CRM", "ADBE", "ORCL", "SNOW", "PLTR",
             "INTC", "QCOM", "AVGO", "TSM", "ASML",
-            "BABA", "JD", "SHOP", "SE"
+            "BABA", "SHOP", "SE"
         ]
     },
     "金融股": {
         "description": "銀行、保險與金融服務",
         "symbols": [
             "JPM", "BAC", "WFC", "C", "GS", "MS", "USB", "PNC",
-            "BRK-B", "AIG", "MET", "PRU", "AFL", "ALL",
+            "BRK-B", "AIG", "MET", "PRU", "AFL",
             "V", "MA", "PYPL", "SQ", "AXP",
-            "BLK", "SCHW", "BX", "KKR"
+            "BLK", "SCHW", "BX"
         ]
     },
     "民生消費股": {
         "description": "日常消費與零售",
         "symbols": [
             "WMT", "HD", "COST", "TGT", "LOW", "TJX",
-            "KO", "PEP", "MDLZ", "KHC", "GIS", "K",
-            "MCD", "SBUX", "YUM", "CMG", "QSR",
-            "PG", "UL", "CL", "KMB", "CLX",
+            "KO", "PEP", "MDLZ", "GIS",
+            "MCD", "SBUX", "YUM", "CMG",
+            "PG", "UL", "CL", "KMB",
             "JNJ", "PFE", "UNH"
         ]
     }
 }
 
-# ==================== 優化的速率限制器 ====================
+# ==================== 速率限制器 ====================
 
 class RateLimiter:
     """改進的速率限制器"""
@@ -324,25 +195,6 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 
-# ==================== 數據模型 ====================
-
-class StockAnalysis(BaseModel):
-    symbol: str
-    companyName: str
-    sector: str
-    buffettScore: float = Field(ge=0, le=100)
-    currentPrice: float = Field(gt=0)
-    momentum: float
-    totalRisk: float = Field(ge=0, le=100)
-    roe: float
-    pe: float | str
-    recommendation: str
-    marketPhase: str
-    factors: Dict[str, int]
-    risks: Dict[str, float]
-    buffettCriteria: Dict
-    details: Dict
-
 # ==================== 資料獲取優化 ====================
 
 class DataFetcher:
@@ -359,27 +211,23 @@ class DataFetcher:
                 try:
                     info = stock.info
                 except Exception:
-                    logger.warning(f"⚠️ {symbol}: info 失敗,嘗試 fast_info")
                     info = stock.fast_info.__dict__ if hasattr(stock, 'fast_info') else {}
                 
                 hist = stock.history(period="1y", auto_adjust=True)
                 
                 if not info or len(info) < config.MIN_INFO_FIELDS:
-                    logger.warning(f"❌ {symbol}: 基本面資料不足")
                     return None, None
                 
                 if hist.empty or len(hist) < config.MIN_HISTORY_DAYS:
-                    logger.warning(f"❌ {symbol}: 歷史數據不足")
                     return None, None
                 
                 return info, hist
                 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    logger.warning(f"⚠️ {symbol}: 第{attempt + 1}次嘗試失敗,重試中... ({e})")
                     await asyncio.sleep(1)
                 else:
-                    logger.error(f"❌ {symbol}: 所有嘗試失敗 - {e}")
+                    logger.error(f"❌ {symbol}: {e}")
                     return None, None
     
     @staticmethod
@@ -409,7 +257,7 @@ class DataFetcher:
 # ==================== 巴菲特選股引擎 ====================
 
 class BuffettStockPicker:
-    """優化的巴菲特選股引擎"""
+    """巴菲特選股引擎"""
     
     BUFFETT_CRITERIA = {
         "roe": {"threshold": 15, "label": "股東權益報酬率 (ROE)", "unit": "%", "operator": ">="},
@@ -450,13 +298,11 @@ class BuffettStockPicker:
             return momentum
             
         except Exception as e:
-            logger.warning(f"⚠️ {self.symbol} 動能計算失敗: {e}")
             return {'1y': 0, '6m': 0, '1m': 0}
     
     def _calculate_technical_indicators(self, hist: pd.DataFrame) -> Dict[str, float]:
         ma200 = hist['Close'].rolling(window=200, min_periods=1).mean().iloc[-1]
         ma50 = hist['Close'].rolling(window=50, min_periods=1).mean().iloc[-1]
-        
         return {'ma200': ma200, 'ma50': ma50}
     
     def _assess_market_phase(self, current_price: float, ma200: float, ma50: float) -> str:
@@ -518,11 +364,7 @@ class BuffettStockPicker:
         
         return max(0, min(100, final_score))
     
-    def _calculate_risk_score(
-        self, 
-        metrics: dict, 
-        hist: pd.DataFrame
-    ) -> Tuple[float, Dict[str, float]]:
+    def _calculate_risk_score(self, metrics: dict, hist: pd.DataFrame) -> Tuple[float, Dict[str, float]]:
         debt_r = min(100, metrics['debt_to_equity'] * 50)
         
         pe = metrics['pe']
@@ -602,7 +444,7 @@ class BuffettStockPicker:
                     "價值觀察 ⭐" if final_score > 55 else "暫避鋒芒"
                 )
                 
-                logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {final_score:.1f}, 等級: {buffett_grade}")
+                logger.info(f"✅ {self.symbol} ({self.sector}) 評分: {final_score:.1f}")
                 
                 return {
                     "symbol": self.symbol,
@@ -621,13 +463,7 @@ class BuffettStockPicker:
                     "buffettCriteria": {
                         "grade": buffett_grade,
                         "criteria_passed": criteria_passed,
-                        "details": {
-                        "high_roe": f"{'✅' if buffett_criteria['high_roe'] else '❌'} ROE {metrics['roe']:.1f}% {'≥' if buffett_criteria['high_roe'] else '<'} 15%",
-                        "reasonable_pe": f"{'✅' if buffett_criteria['reasonable_pe'] else '❌'} P/E {'N/A' if metrics['pe'] > 500 else format(metrics['pe'], '.1f')} {'≤' if buffett_criteria['reasonable_pe'] else '>'} 25",
-                        "low_debt": f"{'✅' if buffett_criteria['low_debt'] else '❌'} 債務比 {metrics['debt_to_equity']:.2f} {'≤' if buffett_criteria['low_debt'] else '>'} 1.0",
-                        "profitable": f"{'✅' if buffett_criteria['profitable'] else '❌'} 利潤率 {metrics['profit_margin']:.1f}% {'≥' if buffett_criteria['profitable'] else '<'} 10%",
-                        "positive_momentum": f"{'✅' if buffett_criteria['positive_momentum'] else '❌'} 6個月趨勢 {'正向' if buffett_criteria['positive_momentum'] else '偏弱'}"
-                    }
+                        "details": buffett_criteria
                     },
                     "details": {
                         "ma200": round(float(tech_indicators['ma200']), 2),
@@ -645,60 +481,32 @@ class BuffettStockPicker:
 # ==================== 核心分析函數 ====================
 
 async def perform_full_analysis() -> Optional[dict]:
-    """執行完整的股票分析 (TOP 25 + 產業分類)"""
+    """執行完整的股票分析"""
     try:
+        if cache_manager.is_analyzing:
+            logger.info("⚠️ 已有分析任務在執行中")
+            return None
+            
+        cache_manager.is_analyzing = True
         logger.info("🚀 開始完整分析...")
 
-        # 1. 嘗試載入本地現有快取
-        existing_cache = cache_manager.load_cache()
-        existing_rankings = []
-        last_update_date = None
-        
-        if existing_cache and 'data' in existing_cache:
-            existing_rankings = existing_cache['data'].get('top_25', {}).get('rankings', [])
-            last_update_str = existing_cache.get('last_update', '')
-            if last_update_str:
-                last_update_date = datetime.fromisoformat(last_update_str).date()
-
-        # 將舊資料轉成字典方便快速查找 { "AAPL": {資料...} }
-        local_db = {s['symbol']: s for s in existing_rankings}
-        today = datetime.now().date()
-        
-        # 2. 決定哪些股票需要「真正下載」，哪些「讀取本地」
         tasks = []
-        final_results = []
-
         for sector_name, pool in STOCK_POOLS.items():
             for symbol in pool["symbols"]:
-                # 補全邏輯：如果是今天更新的，且資料在本地已存在，就直接使用
-                if last_update_date == today and symbol in local_db:
-                    final_results.append(local_db[symbol])
-                    # logger.info(f"📦 {symbol} 使用本地今日快取")
-                else:
-                    # 否則，加入並行下載任務
-                    picker = BuffettStockPicker(symbol, sector_name)
-                    tasks.append(picker.analyze())
+                picker = BuffettStockPicker(symbol, sector_name)
+                tasks.append(picker.analyze())
         
-        # 3. 執行必要的下載任務
-        if tasks:
-            logger.info(f"📊 正在從網路補全/更新 {len(tasks)} 支股票...")
-            downloaded_results = await asyncio.gather(*tasks)
-            # 過濾掉失敗的結果 (None) 並加入最終名單
-            final_results.extend([r for r in downloaded_results if r])
-        else:
-            logger.info("✅ 所有股票均已是最新狀態，無需下載")
-
-        if not final_results:
-            return None
-        
+        results = await asyncio.gather(*tasks)
         all_stocks = [r for r in results if r]
         logger.info(f"✅ 成功分析 {len(all_stocks)} 支股票")
         
-        # 排序取 TOP 25
+        if not all_stocks:
+            cache_manager.is_analyzing = False
+            return None
+        
         all_stocks.sort(key=lambda x: x.get('buffettScore', 0), reverse=True)
         top_25 = all_stocks[:25]
         
-        # 計算統計數據
         sectors_count = {}
         total_score = 0
         total_risk = 0
@@ -716,7 +524,6 @@ async def perform_full_analysis() -> Optional[dict]:
         
         count = len(top_25)
         
-        # 產業分類數據
         sector_analysis = []
         for sector_name, pool in STOCK_POOLS.items():
             sector_stocks = [s for s in all_stocks if s['sector'] == sector_name]
@@ -747,6 +554,8 @@ async def perform_full_analysis() -> Optional[dict]:
                 "sector_risk": sector_risk
             })
         
+        cache_manager.is_analyzing = False
+        
         return {
             "top_25": {
                 "status": "success",
@@ -769,7 +578,108 @@ async def perform_full_analysis() -> Optional[dict]:
         
     except Exception as e:
         logger.error(f"❌ 完整分析失敗: {e}")
+        cache_manager.is_analyzing = False
         return None
+
+# ==================== 每日更新任務 ====================
+
+async def daily_update_task():
+    """每日定時更新任務"""
+    while True:
+        try:
+            now = datetime.now()
+            next_update = datetime.combine(
+                now.date(),
+                dt_time(config.DAILY_UPDATE_HOUR, config.DAILY_UPDATE_MINUTE)
+            )
+            
+            if now >= next_update:
+                next_update += timedelta(days=1)
+            
+            wait_seconds = (next_update - now).total_seconds()
+            logger.info(f"⏰ 下次更新時間: {next_update.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            await asyncio.sleep(wait_seconds)
+            
+            logger.info("🚀 開始每日自動分析...")
+            result = await perform_full_analysis()
+            
+            if result:
+                cache_manager.save_cache(result)
+                logger.info("✅ 每日分析完成")
+            else:
+                logger.error("❌ 每日分析失敗")
+                
+        except Exception as e:
+            logger.error(f"❌ 每日更新任務錯誤: {e}")
+            await asyncio.sleep(3600)
+
+# ==================== 應用啟動管理 ====================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """應用生命週期管理"""
+    global background_task
+    
+    logger.info("🚀 巴菲特選股系統啟動中...")
+    
+    # 載入快取
+    cache_manager.load_cache()
+    
+    # 如果快取無效,立即執行分析
+    if not cache_manager.is_cache_valid():
+        logger.info("⚠️ 快取無效,立即執行分析...")
+        result = await perform_full_analysis()
+        if result:
+            cache_manager.save_cache(result)
+            
+            # 顯示 TOP 15
+            rankings = result['top_25'].get('rankings', [])
+            print("\n" + "="*60)
+            print(f"  🏆 巴菲特選股排行榜 TOP 15")
+            print("="*60)
+            print(f"{'排名':<4} {'代號':<8} {'公司名稱':<25} {'評分':<6} {'等級':<4}")
+            print("-"*60)
+            
+            for i, stock in enumerate(rankings[:15], 1):
+                score = stock.get('buffettScore', 0)
+                grade = stock.get('buffettCriteria', {}).get('grade', 'N/A')
+                symbol = stock.get('symbol', 'N/A')
+                name = stock.get('companyName', 'N/A')[:23]
+                marker = "⭐" if score > 85 else "  "
+                print(f"{i:<4} {symbol:<8} {name:<25} {score:<6.1f} {grade:<4} {marker}")
+            
+            print("-"*60)
+            stats = result['top_25'].get('statistics', {})
+            print(f"📊 總分析: {stats.get('count', 0)} 支 | 優質(A級+): {stats.get('high_grade_stocks', 0)} 支")
+            print("="*60 + "\n")
+    
+    # 啟動背景任務
+    background_task = asyncio.create_task(daily_update_task())
+    logger.info("✅ 系統啟動完成")
+    
+    yield
+    
+    if background_task:
+        background_task.cancel()
+    logger.info("👋 系統關閉")
+
+# ==================== FastAPI 初始化 ====================
+
+app = FastAPI(
+    title=config.API_TITLE,
+    version=config.API_VERSION,
+    description=config.API_DESCRIPTION,
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 # ==================== API 端點 ====================
 
@@ -779,73 +689,71 @@ async def root():
     return {
         "service": config.API_TITLE,
         "version": config.API_VERSION,
-        "description": config.API_DESCRIPTION,
+        "status": "running",
         "cache_status": {
             "is_valid": cache_manager.is_cache_valid(),
-            "last_update": cache_manager.last_update.isoformat() if cache_manager.last_update else None
+            "last_update": cache_manager.last_update.isoformat() if cache_manager.last_update else None,
+            "is_analyzing": cache_manager.is_analyzing
         },
-        "sectors": list(STOCK_POOLS.keys()),
         "total_stocks": sum(len(pool["symbols"]) for pool in STOCK_POOLS.values()),
         "endpoints": {
-            "sp500_analysis": "/sp500-analysis (主要端點 - 返回 TOP 25)",
-            "stock_pool": "/api/stock-pool (產業分類)",
-            "force_refresh": "/api/refresh (強制重新分析)",
+            "top_25": "/sp500-analysis",
+            "sectors": "/api/stock-pool",
+            "refresh": "/api/refresh (POST)",
             "health": "/health"
         }
     }
 
 @app.get("/sp500-analysis")
 async def get_sp500_analysis():
-    """
-    獲取 TOP 25 分析結果 (使用每日快取)
-    前端主要調用此端點
-    """
-    # 嘗試從快取獲取
+    """獲取 TOP 25 分析結果"""
     cached_data = cache_manager.get_cached_data()
     
     if cached_data and 'top_25' in cached_data:
         logger.info("✅ 返回快取的 TOP 25 數據")
         return cached_data['top_25']
     
-    # 快取無效,返回錯誤訊息
-    logger.warning("⚠️ 快取無效,需要等待每日更新")
+    # 如果正在分析中
+    if cache_manager.is_analyzing:
+        raise HTTPException(
+            status_code=202,
+            detail="正在分析中,請稍後再試 (約需 1-2 分鐘)"
+        )
+    
+    # 快取無效且沒有在分析,立即啟動分析
+    logger.info("⚠️ 快取無效,立即啟動分析...")
+    asyncio.create_task(async_analyze_and_cache())
+    
     raise HTTPException(
-        status_code=503,
-        detail="分析數據正在更新中,請稍後再試 (每日自動更新時間: UTC 00:00)"
+        status_code=202,
+        detail="分析任務已啟動,請在 1-2 分鐘後重試"
     )
 
 @app.get("/api/stock-pool")
 async def get_stock_pool(
     sector: Optional[str] = Query(None, description="產業分類"),
-    limit: int = Query(10, ge=1, le=50, description="每個產業返回的股票數量")
+    limit: int = Query(10, ge=1, le=50, description="返回數量")
 ):
-    """
-    獲取產業分類數據 (使用每日快取)
-    """
+    """獲取產業分類數據"""
     cached_data = cache_manager.get_cached_data()
     
     if not cached_data or 'sectors' not in cached_data:
-        raise HTTPException(
-            status_code=503,
-            detail="分析數據正在更新中,請稍後再試"
-        )
+        if cache_manager.is_analyzing:
+            raise HTTPException(status_code=202, detail="正在分析中")
+        
+        asyncio.create_task(async_analyze_and_cache())
+        raise HTTPException(status_code=202, detail="分析任務已啟動")
     
     sectors_data = cached_data['sectors']
     
-    # 如果指定產業,只返回該產業
     if sector:
         sector_result = [s for s in sectors_data if s['sector'] == sector]
         if not sector_result:
-            raise HTTPException(
-                status_code=404,
-                detail=f"找不到產業: {sector}"
-            )
-        # 調整返回的股票數量
+            raise HTTPException(status_code=404, detail=f"找不到產業: {sector}")
         result = sector_result[0].copy()
         result['top_picks'] = result['top_picks'][:limit]
         return [result]
     
-    # 返回所有產業,調整每個產業的股票數量
     results = []
     for s in sectors_data:
         s_copy = s.copy()
@@ -856,22 +764,18 @@ async def get_stock_pool(
 
 @app.post("/api/refresh")
 async def force_refresh(background_tasks: BackgroundTasks):
-    """
-    強制重新分析 (管理員功能)
-    分析將在背景執行
-    """
-    async def refresh_task():
-        logger.info("🔄 強制重新分析...")
-        result = await perform_full_analysis()
-        if result:
-            cache_manager.save_cache(result)
-            logger.info("✅ 強制分析完成")
+    """強制重新分析"""
+    if cache_manager.is_analyzing:
+        return {
+            "status": "already_running",
+            "message": "已有分析任務在執行中"
+        }
     
-    background_tasks.add_task(refresh_task)
+    background_tasks.add_task(async_analyze_and_cache)
     
     return {
         "status": "accepted",
-        "message": "分析任務已啟動,將在背景執行",
+        "message": "分析任務已啟動",
         "estimated_time": "1-2 分鐘"
     }
 
@@ -882,57 +786,28 @@ async def health_check():
     hours = uptime_seconds // 3600
     minutes = (uptime_seconds % 3600) // 60
     
-    cache_valid = cache_manager.is_cache_valid()
-    
     return {
         "status": "healthy",
         "version": config.API_VERSION,
-        "timestamp": datetime.now().isoformat(),
         "uptime": f"{hours}h {minutes}m",
-        "uptime_seconds": uptime_seconds,
-        "cache_status": {
-            "is_valid": cache_valid,
-            "last_update": cache_manager.last_update.isoformat() if cache_manager.last_update else None,
-            "next_update": "每日 UTC 00:00"
-        },
-        "data_info": {
-            "sectors_count": len(STOCK_POOLS),
-            "total_stocks": sum(len(p["symbols"]) for p in STOCK_POOLS.values()),
-            "sectors": list(STOCK_POOLS.keys())
-        },
-        "configuration": {
-            "cache_expire_seconds": config.CACHE_EXPIRE_SECONDS,
-            "max_concurrent_requests": config.MAX_CONCURRENT_REQUESTS,
-            "daily_update_time": f"{config.DAILY_UPDATE_HOUR:02d}:{config.DAILY_UPDATE_MINUTE:02d} UTC"
-        },
-        "environment": "Render" if "RENDER" in os.environ else "Local"
+        "cache_valid": cache_manager.is_cache_valid(),
+        "is_analyzing": cache_manager.is_analyzing,
+        "last_update": cache_manager.last_update.isoformat() if cache_manager.last_update else None
     }
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    """全域例外處理器"""
-    logger.error(f"未處理的例外: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "status": "error",
-            "message": "伺服器內部錯誤",
-            "detail": str(exc) if os.environ.get("DEBUG") else "請稍後再試"
-        }
-    )
+async def async_analyze_and_cache():
+    """背景分析並快取"""
+    result = await perform_full_analysis()
+    if result:
+        cache_manager.save_cache(result)
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    
-    # 1. 取得 Render 分配的 Port，預設為 10000
     port = int(os.environ.get("PORT", 10000))
-    
-    # 2. 啟動服務
     uvicorn.run(
-        "main:app",  # 建議改為 "檔案名稱:app物件名稱"，這樣在某些環境下支援度更好
-        host="0.0.0.0", 
+        "main:app",
+        host="0.0.0.0",
         port=port,
-        proxy_headers=True, # 建議加入：讓後端能正確獲取前端的真實 IP 與 HTTPS 協議
-        forwarded_allow_ips="*" # 建議加入：配合 Render 的反向代理
+        proxy_headers=True,
+        forwarded_allow_ips="*"
     )
